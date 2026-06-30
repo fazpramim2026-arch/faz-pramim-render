@@ -1,0 +1,369 @@
+const express = require('express');
+const cors = require('cors');
+const https = require('https');
+const axios = require('axios');
+const admin = require('firebase-admin');
+const { v4: uuidv4 } = require('uuid');
+
+const app = express();
+app.use(cors({ origin: true }));
+app.use(express.json({ limit: '2mb' }));
+
+const PORT = process.env.PORT || 3000;
+const EFI_BASE_URL = process.env.EFI_BASE_URL || 'https://pix.api.efipay.com.br';
+const EFI_CLIENT_ID = process.env.EFI_CLIENT_ID;
+const EFI_CLIENT_SECRET = process.env.EFI_CLIENT_SECRET;
+const EFI_CHAVE_PIX_APP = process.env.EFI_CHAVE_PIX_APP;
+const EFI_CERT_BASE64 = process.env.EFI_CERT_BASE64;
+const EFI_CERT_PASSWORD = process.env.EFI_CERT_PASSWORD || '';
+const APP_COMISSAO = Number(process.env.APP_COMISSAO || '0.10');
+const FIREBASE_SERVICE_ACCOUNT_BASE64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
+
+function required(name, value) {
+  if (!value) throw new Error(`Variável obrigatória ausente: ${name}`);
+}
+
+function dinheiro2(valor) {
+  return Number(Number(valor || 0).toFixed(2));
+}
+
+function calcularValores(valor) {
+  const valorTotal = dinheiro2(valor);
+  const comissaoApp = dinheiro2(valorTotal * APP_COMISSAO);
+  const valorTrabalhador = dinheiro2(valorTotal - comissaoApp);
+  return { valorTotal, comissaoApp, valorTrabalhador };
+}
+
+function agora() {
+  return admin.firestore.FieldValue.serverTimestamp();
+}
+
+function initFirebase() {
+  if (admin.apps.length) return;
+  required('FIREBASE_SERVICE_ACCOUNT_BASE64', FIREBASE_SERVICE_ACCOUNT_BASE64);
+  const json = Buffer.from(FIREBASE_SERVICE_ACCOUNT_BASE64, 'base64').toString('utf8');
+  const serviceAccount = JSON.parse(json);
+  admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+}
+
+function efiHttpsAgent() {
+  required('EFI_CERT_BASE64', EFI_CERT_BASE64);
+  const pfx = Buffer.from(EFI_CERT_BASE64, 'base64');
+  return new https.Agent({
+    pfx,
+    passphrase: EFI_CERT_PASSWORD,
+    rejectUnauthorized: true,
+  });
+}
+
+function efiClient() {
+  return axios.create({
+    baseURL: EFI_BASE_URL,
+    httpsAgent: efiHttpsAgent(),
+    timeout: 30000,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+let tokenCache = { token: null, expiresAt: 0 };
+async function getEfiToken() {
+  required('EFI_CLIENT_ID', EFI_CLIENT_ID);
+  required('EFI_CLIENT_SECRET', EFI_CLIENT_SECRET);
+
+  if (tokenCache.token && Date.now() < tokenCache.expiresAt - 60000) {
+    return tokenCache.token;
+  }
+
+  const basic = Buffer.from(`${EFI_CLIENT_ID}:${EFI_CLIENT_SECRET}`).toString('base64');
+  const client = efiClient();
+  const resp = await client.post('/oauth/token', { grant_type: 'client_credentials' }, {
+    headers: { Authorization: `Basic ${basic}` },
+  });
+
+  tokenCache = {
+    token: resp.data.access_token,
+    expiresAt: Date.now() + Number(resp.data.expires_in || 3600) * 1000,
+  };
+  return tokenCache.token;
+}
+
+async function efiRequest(method, path, body) {
+  const token = await getEfiToken();
+  const client = efiClient();
+  const resp = await client.request({
+    method,
+    url: path,
+    data: body,
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return resp.data;
+}
+
+async function criarNotificacao(db, userId, titulo, mensagem, tipo, pedidoId) {
+  if (!userId) return;
+  await db.collection('notificacoes').add({
+    userId, titulo, mensagem, tipo, pedidoId: pedidoId || '', lida: false, criadoEm: agora(),
+  });
+}
+
+app.get('/', (req, res) => res.json({ ok: true, app: 'Faz Pra Mim Efí Render Backend' }));
+app.get('/health', (req, res) => res.json({ ok: true, at: new Date().toISOString() }));
+
+app.post('/criarPagamentoPix', async (req, res) => {
+  try {
+    initFirebase();
+    required('EFI_CHAVE_PIX_APP', EFI_CHAVE_PIX_APP);
+    const db = admin.firestore();
+
+    const { pedidoId, clienteId, prestadorId, valor, descricao, emailCliente } = req.body || {};
+    if (!pedidoId || !clienteId || !prestadorId || !valor) {
+      return res.status(400).json({ erro: 'Dados obrigatórios faltando: pedidoId, clienteId, prestadorId, valor' });
+    }
+
+    const { valorTotal, comissaoApp, valorTrabalhador } = calcularValores(valor);
+    const txid = String(pedidoId).replace(/[^a-zA-Z0-9]/g, '').slice(0, 35) || uuidv4().replace(/-/g, '').slice(0, 32);
+
+    const cob = await efiRequest('PUT', `/v2/cob/${txid}`, {
+      calendario: { expiracao: 300 },
+      valor: { original: valorTotal.toFixed(2) },
+      chave: EFI_CHAVE_PIX_APP,
+      solicitacaoPagador: descricao || 'Pagamento Faz Pra Mim',
+      infoAdicionais: [
+        { nome: 'pedidoId', valor: String(pedidoId) },
+        { nome: 'clienteId', valor: String(clienteId) },
+        { nome: 'prestadorId', valor: String(prestadorId) },
+      ],
+    });
+
+    const locId = cob?.loc?.id;
+    let qr = {};
+    if (locId) {
+      qr = await efiRequest('GET', `/v2/loc/${locId}/qrcode`);
+    }
+
+    await db.collection('pagamentos').doc(txid).set({
+      gateway: 'efi', txid, pedidoId, clienteId, prestadorId,
+      valorTotal, comissaoApp, valorTrabalhador,
+      status: cob.status || 'ATIVA',
+      qrCode: qr.qrcode || '',
+      qrCodeBase64: qr.imagemQrcode || '',
+      copiaECola: qr.qrcode || '',
+      locId: locId || null,
+      criadoEm: agora(), atualizadoEm: agora(),
+      expiraEm: admin.firestore.Timestamp.fromDate(new Date(Date.now() + 5 * 60 * 1000)),
+    }, { merge: true });
+
+    await db.collection('pedidos').doc(String(pedidoId)).set({
+      gatewayPagamento: 'efi', pagamentoId: txid, txid,
+      pagamentoStatus: 'pending', pago: false,
+      status: 'aguardando_pagamento', clienteId, prestadorId,
+      valorTotal, comissaoApp, valorTrabalhador,
+      chatLiberado: false, localizacaoLiberada: false,
+      dinheiroRetidoAteConfirmacao: true,
+      pagamentoExpiraEm: admin.firestore.Timestamp.fromDate(new Date(Date.now() + 5 * 60 * 1000)),
+      atualizadoEm: agora(),
+    }, { merge: true });
+
+    res.json({
+      sucesso: true,
+      gateway: 'efi', pagamentoId: txid, txid,
+      status: 'pending', valorTotal, comissaoApp, valorTrabalhador,
+      qrCode: qr.qrcode || '', qrCodeBase64: qr.imagemQrcode || '', ticketUrl: qr.linkVisualizacao || '',
+    });
+  } catch (e) {
+    console.error('criarPagamentoPix erro', e?.response?.data || e.message);
+    res.status(500).json({ erro: 'Erro ao criar Pix Efí', detalhes: e?.response?.data || e.message });
+  }
+});
+
+app.post('/webhookPixEfi', async (req, res) => {
+  try {
+    initFirebase();
+    const db = admin.firestore();
+    const pixList = Array.isArray(req.body?.pix) ? req.body.pix : [];
+
+    for (const pix of pixList) {
+      const txid = pix.txid;
+      if (!txid) continue;
+
+      const pagamentoRef = db.collection('pagamentos').doc(String(txid));
+      const pagamentoDoc = await pagamentoRef.get();
+      const pagamento = pagamentoDoc.data() || {};
+      const pedidoId = pagamento.pedidoId;
+      if (!pedidoId) continue;
+
+      await pagamentoRef.set({
+        status: 'CONCLUIDA', pagamentoStatus: 'pago_bloqueado', e2eId: pix.endToEndId || '',
+        valorPago: Number(pix.valor || pagamento.valorTotal || 0),
+        pagoEm: agora(), atualizadoEm: agora(), webhookPayload: pix,
+      }, { merge: true });
+
+      await db.collection('pedidos').doc(String(pedidoId)).set({
+        pago: true,
+        pagamentoStatus: 'pago_bloqueado',
+        status: 'pago_aguardando_trabalhador',
+        chatLiberado: false,
+        localizacaoLiberada: false,
+        trabalhadorClicouEstouIndo: false,
+        pagamentoConfirmadoEm: agora(),
+        atualizadoEm: agora(),
+      }, { merge: true });
+    }
+
+    res.status(200).json({ ok: true });
+  } catch (e) {
+    console.error('webhookPixEfi erro', e);
+    res.status(200).json({ ok: false });
+  }
+});
+
+app.post('/trabalhadorEstouIndo', async (req, res) => {
+  try {
+    initFirebase();
+    const db = admin.firestore();
+    const { pedidoId, prestadorId } = req.body || {};
+    if (!pedidoId || !prestadorId) return res.status(400).json({ erro: 'Informe pedidoId e prestadorId' });
+
+    const ref = db.collection('pedidos').doc(String(pedidoId));
+    const doc = await ref.get();
+    if (!doc.exists) return res.status(404).json({ erro: 'Pedido não encontrado' });
+    const pedido = doc.data();
+    if (pedido.prestadorId !== prestadorId) return res.status(403).json({ erro: 'Trabalhador incorreto' });
+    if (pedido.pago !== true) return res.status(400).json({ erro: 'Pedido ainda não foi pago' });
+
+    await ref.set({
+      status: 'trabalhador_a_caminho', trabalhadorClicouEstouIndo: true,
+      chatLiberado: true, localizacaoLiberada: true,
+      trabalhadorEstouIndoEm: agora(), atualizadoEm: agora(),
+    }, { merge: true });
+
+    res.json({ sucesso: true });
+  } catch (e) {
+    res.status(500).json({ erro: 'Erro ao marcar Estou indo', detalhes: e.message });
+  }
+});
+
+app.post('/prestadorFinalizouServico', async (req, res) => {
+  try {
+    initFirebase();
+    const db = admin.firestore();
+    const { pedidoId, prestadorId } = req.body || {};
+    if (!pedidoId || !prestadorId) return res.status(400).json({ erro: 'Informe pedidoId e prestadorId' });
+
+    const ref = db.collection('pedidos').doc(String(pedidoId));
+    const doc = await ref.get();
+    if (!doc.exists) return res.status(404).json({ erro: 'Pedido não encontrado' });
+    const pedido = doc.data();
+    if (pedido.prestadorId !== prestadorId) return res.status(403).json({ erro: 'Trabalhador incorreto' });
+    if (pedido.pago !== true) return res.status(400).json({ erro: 'Pedido ainda não foi pago' });
+
+    await ref.set({
+      status: 'aguardando_confirmacao_cliente',
+      trabalhadorFinalizou: true,
+      servicoFinalizadoPeloPrestador: true,
+      servicoFinalizadoEm: agora(), atualizadoEm: agora(),
+    }, { merge: true });
+
+    res.json({ sucesso: true, mensagem: 'Serviço finalizado. Aguardando confirmação do cliente.' });
+  } catch (e) {
+    res.status(500).json({ erro: 'Erro ao finalizar serviço', detalhes: e.message });
+  }
+});
+
+async function enviarPixParaTrabalhador({ chavePix, valor, descricao }) {
+  const idEnvio = uuidv4().replace(/-/g, '').slice(0, 32);
+  const body = {
+    valor: valor.toFixed(2),
+    pagador: { chave: EFI_CHAVE_PIX_APP },
+    favorecido: { chave: chavePix },
+    infoPagador: descricao || 'Repasse Faz Pra Mim',
+  };
+  const data = await efiRequest('PUT', `/v2/gn/pix/${idEnvio}`, body);
+  return { idEnvio, data };
+}
+
+app.post('/clienteConfirmouServico', async (req, res) => {
+  try {
+    initFirebase();
+    required('EFI_CHAVE_PIX_APP', EFI_CHAVE_PIX_APP);
+    const db = admin.firestore();
+    const { pedidoId, clienteId } = req.body || {};
+    if (!pedidoId || !clienteId) return res.status(400).json({ erro: 'Informe pedidoId e clienteId' });
+
+    const pedidoRef = db.collection('pedidos').doc(String(pedidoId));
+    const pedidoDoc = await pedidoRef.get();
+    if (!pedidoDoc.exists) return res.status(404).json({ erro: 'Pedido não encontrado' });
+    const pedido = pedidoDoc.data();
+    if (pedido.clienteId !== clienteId) return res.status(403).json({ erro: 'Cliente incorreto' });
+    if (pedido.pago !== true) return res.status(400).json({ erro: 'Pedido ainda não foi pago' });
+    if (pedido.trabalhadorFinalizou !== true && pedido.servicoFinalizadoPeloPrestador !== true) {
+      return res.status(400).json({ erro: 'Trabalhador ainda não finalizou o serviço' });
+    }
+    if (pedido.repasseTrabalhadorStatus === 'concluido') {
+      return res.json({ sucesso: true, mensagem: 'Serviço já confirmado e repasse já concluído.' });
+    }
+
+    const prestadorId = pedido.prestadorId;
+    const userDoc = await db.collection('usuarios').doc(String(prestadorId)).get();
+    const trabalhador = userDoc.data() || {};
+    const chavePix = String(trabalhador.chavePix || trabalhador.pix || '').trim();
+    if (!chavePix) return res.status(400).json({ erro: 'Trabalhador não possui chave Pix cadastrada.' });
+
+    const valorTotal = dinheiro2(pedido.valorTotal || 0);
+    const comissaoApp = dinheiro2(pedido.comissaoApp || valorTotal * APP_COMISSAO);
+    const valorTrabalhador = dinheiro2(pedido.valorTrabalhador || pedido.valorPrestador || (valorTotal - comissaoApp));
+
+    await pedidoRef.set({
+      status: 'concluido_processando_repasse',
+      clienteConfirmouServico: true,
+      clienteConfirmouFinalizacao: true,
+      clienteConfirmouEm: agora(),
+      repasseTrabalhadorStatus: 'processando',
+      atualizadoEm: agora(),
+    }, { merge: true });
+
+    const repasse = await enviarPixParaTrabalhador({
+      chavePix,
+      valor: valorTrabalhador,
+      descricao: `Repasse pedido ${pedidoId} - Faz Pra Mim`,
+    });
+
+    await db.collection('repasses').add({
+      pedidoId: String(pedidoId), clienteId, prestadorId,
+      valorTotal, comissaoApp, valorTrabalhador,
+      chavePixTrabalhador: chavePix,
+      gateway: 'efi', status: 'concluido',
+      efiIdEnvio: repasse.idEnvio,
+      efiResposta: repasse.data,
+      criadoEm: agora(), atualizadoEm: agora(),
+    });
+
+    await pedidoRef.set({
+      status: 'concluido',
+      pagamentoStatus: 'repasse_concluido',
+      dinheiroRetidoAteConfirmacao: false,
+      repasseTrabalhadorStatus: 'concluido',
+      repasseTrabalhadorEm: agora(),
+      valorTotal, comissaoApp, valorTrabalhador,
+      atualizadoEm: agora(),
+    }, { merge: true });
+
+    await criarNotificacao(db, prestadorId, 'Pagamento recebido', `Seu repasse de R$ ${valorTrabalhador.toFixed(2).replace('.', ',')} foi enviado por Pix.`, 'repasse_concluido', String(pedidoId));
+
+    res.json({ sucesso: true, mensagem: 'Serviço confirmado e repasse enviado.', valorTotal, comissaoApp, valorTrabalhador });
+  } catch (e) {
+    console.error('clienteConfirmouServico erro', e?.response?.data || e.message);
+    try {
+      if (req.body?.pedidoId) {
+        await admin.firestore().collection('pedidos').doc(String(req.body.pedidoId)).set({
+          repasseTrabalhadorStatus: 'erro',
+          repasseTrabalhadorErro: JSON.stringify(e?.response?.data || e.message).slice(0, 900),
+          atualizadoEm: agora(),
+        }, { merge: true });
+      }
+    } catch (_) {}
+    res.status(500).json({ erro: 'Erro ao confirmar serviço ou enviar Pix', detalhes: e?.response?.data || e.message });
+  }
+});
+
+app.listen(PORT, () => console.log(`Faz Pra Mim Efí backend rodando na porta ${PORT}`));

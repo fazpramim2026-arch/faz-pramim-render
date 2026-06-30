@@ -1,0 +1,19 @@
+{
+  "name": "faz-pramim-efi-render-backend",
+  "version": "1.0.0",
+  "description": "Backend Faz Pra Mim com Efí Pix Cash-In/Cash-Out para Render",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.9",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "firebase-admin": "^13.0.2",
+    "uuid": "^11.0.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

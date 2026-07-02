@@ -121,7 +121,10 @@ app.post('/criarPagamentoPix', async (req, res) => {
     }
 
     const { valorTotal, comissaoApp, valorTrabalhador } = calcularValores(valor);
-    const txid = String(pedidoId).replace(/[^a-zA-Z0-9]/g, '').slice(0, 35) || uuidv4().replace(/-/g, '').slice(0, 32);
+    const baseTxid = String(pedidoId || '').replace(/[^a-zA-Z0-9]/g, '');
+    const txid = baseTxid.length >= 26 && baseTxid.length <= 35
+    ? baseTxid
+    : uuidv4().replace(/-/g, '').slice(0, 32);
 
     const cob = await efiRequest('PUT', `/v2/cob/${txid}`, {
       calendario: { expiracao: 300 },

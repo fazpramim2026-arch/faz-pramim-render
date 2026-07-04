@@ -453,8 +453,24 @@ async function enviarPixParaTrabalhador({ chavePix, valor, descricao }) {
     favorecido: { chave: chavePix },
   };
   console.log('Body enviado para envio Pix Efi:', body);
-  const data = await efiRequest('PUT', `/v3/gn/pix/${idEnvio}`, body);
-  return { idEnvio, data };
+  console.log("Enviando repasse Pix", body);
+  try {
+    const token = await getEfiToken();
+    const client = efiClient();
+    const response = await client.request({
+      method: 'PUT',
+      url: `/v3/gn/pix/${idEnvio}`,
+      data: body,
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    console.log("Resposta Efí:", response.status, response.data);
+    return { idEnvio, data: response.data };
+  } catch (error) {
+    console.error("Erro Efí:", error.response?.status);
+    console.error("Resposta Efí:", error.response?.data);
+    console.error(error.message);
+    throw error;
+  }
 }
 
 async function enviarPixParaTrabalhadorComId({ idEnvio, chavePix, valor, descricao }) {
@@ -464,8 +480,24 @@ async function enviarPixParaTrabalhadorComId({ idEnvio, chavePix, valor, descric
     favorecido: { chave: chavePix },
   };
   console.log('Body enviado para envio Pix Efi:', body);
-  const data = await efiRequest('PUT', `/v3/gn/pix/${idEnvio}`, body);
-  return { idEnvio, data };
+  console.log("Enviando repasse Pix", body);
+  try {
+    const token = await getEfiToken();
+    const client = efiClient();
+    const response = await client.request({
+      method: 'PUT',
+      url: `/v3/gn/pix/${idEnvio}`,
+      data: body,
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    console.log("Resposta Efí:", response.status, response.data);
+    return { idEnvio, data: response.data };
+  } catch (error) {
+    console.error("Erro Efí:", error.response?.status);
+    console.error("Resposta Efí:", error.response?.data);
+    console.error(error.message);
+    throw error;
+  }
 }
 
 app.post('/clienteConfirmouServico', async (req, res) => {

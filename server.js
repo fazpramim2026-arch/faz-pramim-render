@@ -90,13 +90,25 @@ async function getEfiToken() {
 async function efiRequest(method, path, body) {
   const token = await getEfiToken();
   const client = efiClient();
-  const resp = await client.request({
-    method,
-    url: path,
-    data: body,
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  return resp.data;
+  try {
+    const resp = await client.request({
+      method,
+      url: path,
+      data: body,
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return resp.data;
+  } catch (e) {
+    console.log('Erro completo retornado pela Efi:', {
+      method,
+      path,
+      status: e?.response?.status,
+      headers: e?.response?.headers,
+      data: e?.response?.data,
+      message: e.message,
+    });
+    throw e;
+  }
 }
 
 async function criarNotificacao(db, userId, titulo, mensagem, tipo, pedidoId) {
@@ -379,8 +391,8 @@ async function enviarPixParaTrabalhador({ chavePix, valor, descricao }) {
     valor: valor.toFixed(2),
     pagador: { chave: EFI_CHAVE_PIX_APP },
     favorecido: { chave: chavePix },
-    infoPagador: descricao || 'Repasse Faz Pra Mim',
   };
+  console.log('Body enviado para envio Pix Efi:', body);
   const data = await efiRequest('PUT', `/v3/gn/pix/${idEnvio}`, body);
   return { idEnvio, data };
 }
@@ -390,8 +402,8 @@ async function enviarPixParaTrabalhadorComId({ idEnvio, chavePix, valor, descric
     valor: valor.toFixed(2),
     pagador: { chave: EFI_CHAVE_PIX_APP },
     favorecido: { chave: chavePix },
-    infoPagador: descricao || 'Repasse Faz Pra Mim',
   };
+  console.log('Body enviado para envio Pix Efi:', body);
   const data = await efiRequest('PUT', `/v3/gn/pix/${idEnvio}`, body);
   return { idEnvio, data };
 }

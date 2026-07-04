@@ -1,660 +1,1065 @@
-const express = require('express');
-const cors = require('cors');
-const https = require('https');
-const axios = require('axios');
-const admin = require('firebase-admin');
-const { v4: uuidv4 } = require('uuid');
+const express = require("express");
+const cors = require("cors");
+const admin = require("firebase-admin");
+const axios = require("axios");
+const https = require("https");
+const fs = require("fs");
+const crypto = require("crypto");
 
 const app = express();
 app.use(cors({ origin: true }));
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: "1mb" }));
 
-const PORT = process.env.PORT || 3000;
-const EFI_BASE_URL = process.env.EFI_BASE_URL || 'https://pix.api.efipay.com.br';
-const EFI_CLIENT_ID = process.env.EFI_CLIENT_ID;
-const EFI_CLIENT_SECRET = process.env.EFI_CLIENT_SECRET;
-const EFI_CHAVE_PIX_APP = process.env.EFI_CHAVE_PIX_APP;
-const EFI_CERT_BASE64 = process.env.EFI_CERT_BASE64;
-const EFI_CERT_PASSWORD = process.env.EFI_CERT_PASSWORD || '';
-const APP_COMISSAO = Number(process.env.APP_COMISSAO || '0.10');
-const FIREBASE_SERVICE_ACCOUNT_BASE64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
+if (!admin.apps.length) {
+  const serviceAccountBase64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
+  const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT;
 
-function required(name, value) {
-  if (!value) throw new Error(`Variável obrigatória ausente: ${name}`);
+  if (serviceAccountBase64) {
+    const serviceAccount = JSON.parse(
+      Buffer.from(serviceAccountBase64, "base64").toString("utf8")
+    );
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+  } else if (serviceAccountJson) {
+    admin.initializeApp({
+      credential: admin.credential.cert(JSON.parse(serviceAccountJson)),
+    });
+  } else {
+    admin.initializeApp();
+  }
 }
 
-function dinheiro2(valor) {
-  return Number(Number(valor || 0).toFixed(2));
+const db = admin.firestore();
+
+function agora() {
+  return new Date();
+}
+
+function normalizarId(valor) {
+  return String(valor || "").trim();
+}
+
+function normalizarDescricao(valor) {
+  return String(valor || "Pagamento Faz Pra Mim").trim().slice(0, 140);
+}
+
+function pegarBearerToken(req) {
+  const header = req.headers.authorization || req.headers.Authorization || "";
+  if (!header.startsWith("Bearer ")) return "";
+  return header.replace("Bearer ", "").trim();
+}
+
+async function verificarUsuarioPeloToken(req) {
+  const idToken = pegarBearerToken(req);
+
+  if (!idToken) {
+    const erro = new Error("Token de autenticacao nao enviado.");
+    erro.status = 401;
+    throw erro;
+  }
+
+  return admin.auth().verifyIdToken(idToken);
+}
+
+async function carregarPedidoAutorizado(pedidoId, decoded, papelEsperado) {
+  const pedidoRef = db.collection("pedidos").doc(String(pedidoId));
+  const pedidoDoc = await pedidoRef.get();
+
+  if (!pedidoDoc.exists) {
+    const erro = new Error("Pedido nao encontrado.");
+    erro.status = 404;
+    throw erro;
+  }
+
+  const pedido = pedidoDoc.data() || {};
+  const uid = decoded.uid;
+  const clienteAutorizado = pedido.clienteId === uid;
+  const prestadorAutorizado =
+    pedido.prestadorId === uid || pedido.aceitoPor === uid;
+
+  if (
+    (papelEsperado === "cliente" && !clienteAutorizado) ||
+    (papelEsperado === "prestador" && !prestadorAutorizado) ||
+    (papelEsperado === "participante" &&
+      !clienteAutorizado &&
+      !prestadorAutorizado)
+  ) {
+    const erro = new Error("Usuario sem permissao para este pedido.");
+    erro.status = 403;
+    throw erro;
+  }
+
+  return { pedidoRef, pedido };
+}
+
+function valorDoPedido(pedido) {
+  const candidatos = [
+    pedido.valorTotal,
+    pedido.valorServico,
+    pedido.valor,
+    pedido.preco,
+  ];
+  const valor = Number(candidatos.find((item) => Number(item) > 0) || 0);
+
+  if (!Number.isFinite(valor) || valor <= 0) {
+    const erro = new Error("Pedido sem valor valido.");
+    erro.status = 400;
+    throw erro;
+  }
+
+  return valor;
 }
 
 function calcularValores(valor) {
-  const valorTotal = dinheiro2(valor);
-  const comissaoApp = dinheiro2(valorTotal * APP_COMISSAO);
-  const valorTrabalhador = dinheiro2(valorTotal - comissaoApp);
-  return { valorTotal, comissaoApp, valorTrabalhador };
+  const valorTotal = Number(valor);
+  const comissaoApp = Number((valorTotal * 0.1).toFixed(2));
+  const valorPrestador = Number((valorTotal - comissaoApp).toFixed(2));
+
+  return { valorTotal, comissaoApp, valorPrestador };
 }
 
-function agora() {
-  return admin.firestore.FieldValue.serverTimestamp();
+function txidDoPedido(pedidoId) {
+  return crypto
+    .createHash("sha256")
+    .update(`fazpramim-${String(pedidoId)}`)
+    .digest("hex")
+    .slice(0, 32);
 }
 
-function initFirebase() {
-  if (admin.apps.length) return;
-  required('FIREBASE_SERVICE_ACCOUNT_BASE64', FIREBASE_SERVICE_ACCOUNT_BASE64);
-  const json = Buffer.from(FIREBASE_SERVICE_ACCOUNT_BASE64, 'base64').toString('utf8');
-  const serviceAccount = JSON.parse(json);
-  admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+function idEnvioDoPedido(pedidoId) {
+  return crypto
+    .createHash("sha256")
+    .update(`repasse-fazpramim-${String(pedidoId)}`)
+    .digest("hex")
+    .slice(0, 35);
 }
 
-function efiHttpsAgent() {
-  required('EFI_CERT_BASE64', EFI_CERT_BASE64);
-  const pfx = Buffer.from(EFI_CERT_BASE64, 'base64');
+function somenteDinheiro(valor) {
+  const numero = Number(valor || 0);
+
+  if (!Number.isFinite(numero) || numero <= 0) {
+    const erro = new Error("Valor Pix invalido.");
+    erro.status = 400;
+    throw erro;
+  }
+
+  return numero.toFixed(2);
+}
+
+function detalhesErroEfi(erro) {
+  if (erro?.response) {
+    return {
+      message: erro.message,
+      status: erro.response.status,
+      data: erro.response.data,
+    };
+  }
+
+  try {
+    return JSON.parse(erro.message);
+  } catch (_) {
+    return { message: erro.message };
+  }
+}
+
+function erroPublicoEfi(erro) {
+  const detalhes = detalhesErroEfi(erro);
+  return {
+    mensagem: detalhes.message || erro.message,
+    status: detalhes.status || null,
+    data: detalhes.data || null,
+  };
+}
+
+function getEfiConfig() {
+  return {
+    baseUrl: process.env.EFI_BASE_URL || "https://pix.api.efipay.com.br",
+    clientId: process.env.EFI_CLIENT_ID,
+    clientSecret: process.env.EFI_CLIENT_SECRET,
+    certPath: process.env.EFI_CERT_PATH || "./certs/efi_producao.p12",
+    certBase64: process.env.EFI_CERT_BASE64,
+    certPemPath: process.env.EFI_CERT_PEM_PATH,
+    keyPemPath: process.env.EFI_KEY_PEM_PATH,
+    certPemBase64: process.env.EFI_CERT_PEM_BASE64,
+    keyPemBase64: process.env.EFI_KEY_PEM_BASE64,
+    certPassphrase: process.env.EFI_CERT_PASSPHRASE || "",
+    chavePixApp: process.env.EFI_CHAVE_PIX_APP,
+    webhookPixUrl:
+      process.env.EFI_WEBHOOK_PIX_URL ||
+      "https://faz-pramim-render.onrender.com/webhookPixEfi",
+  };
+}
+
+function validarEfiConfig() {
+  const cfg = getEfiConfig();
+  const faltando = [];
+
+  if (!cfg.clientId) faltando.push("EFI_CLIENT_ID");
+  if (!cfg.clientSecret) faltando.push("EFI_CLIENT_SECRET");
+  const temP12 = cfg.certBase64 || fs.existsSync(cfg.certPath);
+  const temPem =
+    (cfg.certPemBase64 && cfg.keyPemBase64) ||
+    (cfg.certPemPath &&
+      cfg.keyPemPath &&
+      fs.existsSync(cfg.certPemPath) &&
+      fs.existsSync(cfg.keyPemPath));
+
+  if (!temP12 && !temPem) {
+    faltando.push(
+      "EFI_CERT_BASE64/EFI_CERT_PATH ou EFI_CERT_PEM_BASE64+EFI_KEY_PEM_BASE64"
+    );
+  }
+
+  if (faltando.length) {
+    throw new Error(`Configuração Efí incompleta: ${faltando.join(", ")}`);
+  }
+
+  return cfg;
+}
+
+function efiAgent() {
+  const cfg = validarEfiConfig();
+
+  if (
+    (cfg.certPemBase64 && cfg.keyPemBase64) ||
+    (cfg.certPemPath && cfg.keyPemPath)
+  ) {
+    const cert = cfg.certPemBase64
+      ? Buffer.from(cfg.certPemBase64, "base64").toString("utf8")
+      : fs.readFileSync(cfg.certPemPath, "utf8");
+    const key = cfg.keyPemBase64
+      ? Buffer.from(cfg.keyPemBase64, "base64").toString("utf8")
+      : fs.readFileSync(cfg.keyPemPath, "utf8");
+
+    return new https.Agent({
+      cert,
+      key,
+      passphrase: cfg.certPassphrase,
+      keepAlive: true,
+    });
+  }
+
+  const pfx = cfg.certBase64
+    ? Buffer.from(cfg.certBase64, "base64")
+    : fs.readFileSync(cfg.certPath);
+
   return new https.Agent({
     pfx,
-    passphrase: EFI_CERT_PASSWORD,
-    rejectUnauthorized: true,
+    passphrase: cfg.certPassphrase,
+    keepAlive: true,
   });
 }
 
-function efiClient() {
-  return axios.create({
-    baseURL: EFI_BASE_URL,
-    httpsAgent: efiHttpsAgent(),
-    timeout: 30000,
-    headers: { 'Content-Type': 'application/json' },
-  });
-}
+let tokenEfiCache = null;
+let tokenEfiExpiraEm = 0;
 
-let tokenCache = { token: null, expiresAt: 0 };
-async function getEfiToken() {
-  required('EFI_CLIENT_ID', EFI_CLIENT_ID);
-  required('EFI_CLIENT_SECRET', EFI_CLIENT_SECRET);
+async function obterTokenEfi() {
+  const cfg = validarEfiConfig();
 
-  if (tokenCache.token && Date.now() < tokenCache.expiresAt - 60000) {
-    return tokenCache.token;
+  if (tokenEfiCache && Date.now() < tokenEfiExpiraEm) {
+    return tokenEfiCache;
   }
 
-  const basic = Buffer.from(`${EFI_CLIENT_ID}:${EFI_CLIENT_SECRET}`).toString('base64');
-  const client = efiClient();
-  const resp = await client.post('/oauth/token', { grant_type: 'client_credentials' }, {
-    headers: { Authorization: `Basic ${basic}` },
+  const auth = Buffer.from(`${cfg.clientId}:${cfg.clientSecret}`).toString(
+    "base64"
+  );
+
+  console.log("Efí OAuth: solicitando token client_credentials.");
+
+  const resposta = await axios({
+    method: "POST",
+    url: `${cfg.baseUrl}/oauth/token`,
+    httpsAgent: efiAgent(),
+    headers: {
+      Authorization: `Basic ${auth}`,
+      "Content-Type": "application/json",
+      "Accept-Encoding": "identity",
+    },
+    data: { grant_type: "client_credentials" },
+    validateStatus: () => true,
   });
 
-  tokenCache = {
-    token: resp.data.access_token,
-    expiresAt: Date.now() + Number(resp.data.expires_in || 3600) * 1000,
-  };
-  return tokenCache.token;
+  if (resposta.status < 200 || resposta.status >= 300) {
+    console.error("Efí OAuth: falha ao obter token.", {
+      status: resposta.status,
+      data: resposta.data,
+    });
+    throw new Error(
+      JSON.stringify({ status: resposta.status, data: resposta.data })
+    );
+  }
+
+  tokenEfiCache = resposta.data.access_token;
+  tokenEfiExpiraEm =
+    Date.now() + (Number(resposta.data.expires_in || 3000) - 60) * 1000;
+
+  return tokenEfiCache;
 }
 
-async function efiRequest(method, path, body, extraHeaders = {}) {
-  const token = await getEfiToken();
-  const client = efiClient();
-  try {
-    const resp = await client.request({
-      method,
-      url: path,
-      data: body,
-      headers: { Authorization: `Bearer ${token}`, ...extraHeaders },
-    });
-    return resp.data;
-  } catch (e) {
-    console.log('Erro completo retornado pela Efi:', {
+function exigirChavePixEfi(cfg) {
+  if (!cfg.chavePixApp) {
+    throw new Error("ConfiguraÃ§Ã£o EfÃ­ incompleta: EFI_CHAVE_PIX_APP");
+  }
+}
+
+function urlWebhookPixEfiComIgnorar(url) {
+  const webhookUrl = String(url || "").trim();
+
+  if (!webhookUrl) {
+    throw new Error("URL do webhook Pix EfÃ­ nÃ£o configurada");
+  }
+
+  if (/[?&]ignorar=/.test(webhookUrl)) {
+    return webhookUrl;
+  }
+
+  return webhookUrl.includes("?")
+    ? `${webhookUrl}&ignorar=`
+    : `${webhookUrl}?ignorar=`;
+}
+
+async function efiRequest(method, path, data, extraHeaders = {}) {
+  const cfg = validarEfiConfig();
+  const token = await obterTokenEfi();
+
+  console.log("Efí request:", {
+    method,
+    path,
+    hasBody: data !== undefined && data !== null,
+  });
+
+  const resposta = await axios({
+    method,
+    url: `${cfg.baseUrl}${path}`,
+    httpsAgent: efiAgent(),
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      "Accept-Encoding": "identity",
+      ...extraHeaders,
+    },
+    data,
+    validateStatus: () => true,
+  });
+
+  if (resposta.status < 200 || resposta.status >= 300) {
+    console.error("Efí request falhou:", {
       method,
       path,
-      status: e?.response?.status,
-      headers: e?.response?.headers,
-      data: e?.response?.data,
-      message: e.message,
+      status: resposta.status,
+      data: resposta.data,
     });
-    throw e;
+    throw new Error(
+      JSON.stringify({
+        status: resposta.status,
+        data: resposta.data,
+      })
+    );
   }
+
+  console.log("Efí request OK:", { method, path, status: resposta.status });
+  return resposta.data;
 }
 
-function webhookPixEfiUrlComIgnorar(webhookUrl) {
-  const url = String(webhookUrl || '').trim();
-  if (!url) throw new Error('URL do webhook Pix Efi ausente');
-  if (/[?&]ignorar=/.test(url)) return url;
-  return url.includes('?') ? `${url}&ignorar=` : `${url}?ignorar=`;
-}
-
-async function criarNotificacao(db, userId, titulo, mensagem, tipo, pedidoId) {
+async function criarNotificacao(userId, titulo, mensagem, tipo, pedidoId) {
   if (!userId) return;
-  await db.collection('notificacoes').add({
-    userId, titulo, mensagem, tipo, pedidoId: pedidoId || '', lida: false, criadoEm: agora(),
+
+  await db.collection("notificacoes").add({
+    userId,
+    titulo,
+    mensagem,
+    tipo,
+    pedidoId: pedidoId || "",
+    lida: false,
+    criadoEm: agora(),
   });
 }
 
-app.get('/', (req, res) => res.json({ ok: true, app: 'Faz Pra Mim Efí Render Backend' }));
-app.get('/health', (req, res) => res.json({ ok: true, at: new Date().toISOString() }));
-
-app.post('/configurarWebhookPixEfi', async (req, res) => {
+app.post(["/criarPagamentoPix", "/criarPagamentoPixEfi"], async (req, res) => {
   try {
-    required('EFI_CHAVE_PIX_APP', EFI_CHAVE_PIX_APP);
-    const webhookUrl = 'https://faz-pramim-render.onrender.com/webhookPixEfi';
-    const resposta = await efiRequest(
-      'PUT',
-      `/v2/webhook/${encodeURIComponent(EFI_CHAVE_PIX_APP)}`,
-      { webhookUrl }
-    );
+    const decoded = await verificarUsuarioPeloToken(req);
+    const { pedidoId, valor, descricao, emailCliente } = req.body || {};
+    const pedidoIdSeguro = normalizarId(pedidoId);
 
-    res.json({
-      sucesso: true,
-      chave: EFI_CHAVE_PIX_APP,
-      webhookUrl,
-      resposta,
-    });
-  } catch (e) {
-    console.error('configurarWebhookPixEfi erro', e?.response?.data || e.message);
-    res.status(500).json({
-      erro: 'Erro ao configurar webhook Pix Efí',
-      detalhes: e?.response?.data || e.message,
-    });
-  }
-});
-
-app.post('/cadastrarWebhookPixEfi', async (req, res) => {
-  try {
-    required('EFI_CHAVE_PIX_APP', EFI_CHAVE_PIX_APP);
-    const webhookUrl = webhookPixEfiUrlComIgnorar(
-      req.body?.webhookUrl || 'https://faz-pramim-render.onrender.com/webhookPixEfi'
-    );
-    const resposta = await efiRequest(
-      'PUT',
-      `/v2/webhook/${encodeURIComponent(EFI_CHAVE_PIX_APP)}`,
-      { webhookUrl },
-      { 'x-skip-mtls-checking': 'true' }
-    );
-
-    res.json({
-      sucesso: true,
-      chave: EFI_CHAVE_PIX_APP,
-      webhookUrl,
-      resposta,
-    });
-  } catch (e) {
-    console.error('cadastrarWebhookPixEfi erro', e?.response?.data || e.message);
-    res.status(500).json({
-      erro: 'Erro ao cadastrar webhook Pix Efi',
-      detalhes: e?.response?.data || e.message,
-    });
-  }
-});
-
-app.post('/criarPagamentoPix', async (req, res) => {
-  try {
-    initFirebase();
-    required('EFI_CHAVE_PIX_APP', EFI_CHAVE_PIX_APP);
-    const db = admin.firestore();
-
-    const { pedidoId, clienteId, prestadorId, valor, descricao, emailCliente } = req.body || {};
-    if (!pedidoId || !clienteId || !prestadorId || !valor) {
-      return res.status(400).json({ erro: 'Dados obrigatórios faltando: pedidoId, clienteId, prestadorId, valor' });
+    if (!pedidoIdSeguro) {
+      return res.status(400).json({ erro: "Informe pedidoId" });
     }
 
-    const { valorTotal, comissaoApp, valorTrabalhador } = calcularValores(valor);
-    const baseTxid = String(pedidoId || '').replace(/[^a-zA-Z0-9]/g, '');
-    const txid = baseTxid.length >= 26 && baseTxid.length <= 35
-    ? baseTxid
-    : uuidv4().replace(/-/g, '').slice(0, 32);
+    const { pedido } = await carregarPedidoAutorizado(
+      pedidoIdSeguro,
+      decoded,
+      "cliente"
+    );
+    const clienteIdSeguro = pedido.clienteId;
+    const prestadorIdSeguro = pedido.prestadorId || pedido.aceitoPor;
+    const emailSeguro = decoded.email || emailCliente || "";
+    const valorBase = valorDoPedido(pedido);
 
-    const cob = await efiRequest('PUT', `/v2/cob/${txid}`, {
+    if (!prestadorIdSeguro) {
+      return res.status(400).json({ erro: "Pedido sem trabalhador vinculado." });
+    }
+
+    if (valor && Math.abs(Number(valor) - valorBase) > 0.01) {
+      return res
+        .status(400)
+        .json({ erro: "Valor informado nao confere com o pedido." });
+    }
+
+    const cfg = validarEfiConfig();
+    exigirChavePixEfi(cfg);
+
+    const { valorTotal, comissaoApp, valorPrestador } =
+      calcularValores(valorBase);
+    const txid = txidDoPedido(pedidoIdSeguro);
+    const pagamentoRef = db.collection("pagamentos").doc(txid);
+    const pagamentoExistente = await pagamentoRef.get();
+
+    if (pagamentoExistente.exists) {
+      const pagamento = pagamentoExistente.data() || {};
+      if (pagamento.qrCode || pagamento.status === "CONCLUIDA") {
+        console.log("Pix Efí já existia para o pedido; retornando dados salvos.", {
+          pedidoId: pedidoIdSeguro,
+          txid,
+          status: pagamento.status,
+        });
+        return res.status(200).json({
+          sucesso: true,
+          provedor: "efi",
+          pagamentoId: txid,
+          txid,
+          status: pagamento.status || "pending",
+          valorTotal,
+          comissaoApp,
+          valorPrestador,
+          qrCode: pagamento.qrCode || "",
+          qrCodeBase64: pagamento.qrCodeBase64 || "",
+          ticketUrl: pagamento.ticketUrl || "",
+        });
+      }
+    }
+
+    console.log("Criando cobrança Pix Efí.", {
+      pedidoId: pedidoIdSeguro,
+      txid,
+      clienteId: clienteIdSeguro,
+      prestadorId: prestadorIdSeguro,
+      valorTotal,
+    });
+
+    const expiraEm = new Date(Date.now() + 5 * 60 * 1000);
+    const cobranca = await efiRequest("PUT", `/v2/cob/${txid}`, {
       calendario: { expiracao: 300 },
-      valor: { original: valorTotal.toFixed(2) },
-      chave: EFI_CHAVE_PIX_APP,
-      solicitacaoPagador: descricao || 'Pagamento Faz Pra Mim',
-      infoAdicionais: [
-        { nome: 'pedidoId', valor: String(pedidoId) },
-        { nome: 'clienteId', valor: String(clienteId) },
-        { nome: 'prestadorId', valor: String(prestadorId) },
-      ],
+      valor: { original: somenteDinheiro(valorTotal) },
+      chave: cfg.chavePixApp,
+      solicitacaoPagador: normalizarDescricao(descricao),
     });
 
-    const locId = cob?.loc?.id;
     let qr = {};
-    if (locId) {
-      qr = await efiRequest('GET', `/v2/loc/${locId}/qrcode`);
+    if (cobranca.loc && cobranca.loc.id) {
+      qr = await efiRequest("GET", `/v2/loc/${cobranca.loc.id}/qrcode`);
     }
 
-    await db.collection('pagamentos').doc(txid).set({
-      gateway: 'efi', txid, pedidoId, clienteId, prestadorId,
-      valorTotal, comissaoApp, valorTrabalhador,
-      status: cob.status || 'ATIVA',
-      qrCode: qr.qrcode || '',
-      qrCodeBase64: qr.imagemQrcode || '',
-      copiaECola: qr.qrcode || '',
-      locId: locId || null,
-      criadoEm: agora(), atualizadoEm: agora(),
-      expiraEm: admin.firestore.Timestamp.fromDate(new Date(Date.now() + 5 * 60 * 1000)),
-    }, { merge: true });
-
-    await db.collection('pedidos').doc(String(pedidoId)).set({
-      gatewayPagamento: 'efi', pagamentoId: txid, txid,
-      pagamentoStatus: 'pending', pago: false,
-      status: 'aguardando_pagamento', clienteId, prestadorId,
-      valorTotal, comissaoApp, valorTrabalhador,
-      chatLiberado: false, localizacaoLiberada: false,
-      dinheiroRetidoAteConfirmacao: true,
-      pagamentoExpiraEm: admin.firestore.Timestamp.fromDate(new Date(Date.now() + 5 * 60 * 1000)),
-      atualizadoEm: agora(),
-    }, { merge: true });
-
-    res.json({
-      sucesso: true,
-      gateway: 'efi', pagamentoId: txid, txid,
-      status: 'pending', valorTotal, comissaoApp, valorTrabalhador,
-      qrCode: qr.qrcode || '', qrCodeBase64: qr.imagemQrcode || '', ticketUrl: qr.linkVisualizacao || '',
-    });
-  } catch (e) {
-    console.error('criarPagamentoPix erro', e?.response?.data || e.message);
-    res.status(500).json({ erro: 'Erro ao criar Pix Efí', detalhes: e?.response?.data || e.message });
-  }
-});
-
-app.post('/webhookPixEfi', async (req, res) => {
-  try {
-    initFirebase();
-    const db = admin.firestore();
-    const pixList = Array.isArray(req.body?.pix) ? req.body.pix : [];
-
-    for (const pix of pixList) {
-      const txid = pix.txid;
-      if (!txid) continue;
-
-      const pagamentoRef = db.collection('pagamentos').doc(String(txid));
-      const pagamentoDoc = await pagamentoRef.get();
-      const pagamento = pagamentoDoc.data() || {};
-      const pedidoId = pagamento.pedidoId;
-      if (!pedidoId) continue;
-
-      await pagamentoRef.set({
-        status: 'CONCLUIDA', pagamentoStatus: 'pago_bloqueado', e2eId: pix.endToEndId || '',
-        valorPago: Number(pix.valor || pagamento.valorTotal || 0),
-        pagoEm: agora(), atualizadoEm: agora(), webhookPayload: pix,
-      }, { merge: true });
-
-      await db.collection('pedidos').doc(String(pedidoId)).set({
-        pago: true,
-        pagamentoStatus: 'pago_bloqueado',
-        status: 'pago_aguardando_trabalhador',
-        chatLiberado: false,
-        localizacaoLiberada: false,
-        trabalhadorClicouEstouIndo: false,
-        pagamentoConfirmadoEm: agora(),
-        atualizadoEm: agora(),
-      }, { merge: true });
-    }
-
-    res.status(200).json({ ok: true });
-  } catch (e) {
-    console.error('webhookPixEfi erro', e);
-    res.status(200).json({ ok: false });
-  }
-});
-
-app.post('/verificarPagamentoManual', async (req, res) => {
-  try {
-    initFirebase();
-    const db = admin.firestore();
-    const { pagamentoId, txid, pedidoId } = req.body || {};
-    const txidSeguro = String(txid || pagamentoId || '').trim();
-    const pedidoIdInformado = String(pedidoId || '').trim();
-
-    if (!txidSeguro) {
-      return res.status(400).json({ erro: 'Informe pagamentoId ou txid' });
-    }
-
-    const cob = await efiRequest('GET', `/v2/cob/${txidSeguro}`);
-    const statusEfi = String(cob.status || '');
-    const pagamentoRef = db.collection('pagamentos').doc(txidSeguro);
-    const pagamentoDoc = await pagamentoRef.get();
-    const pagamento = pagamentoDoc.data() || {};
-    let pedidoIdSeguro = String(pagamento.pedidoId || pedidoIdInformado || '').trim();
-
-    if (!pedidoIdSeguro) {
-      const pedidoSnap = await db
-        .collection('pedidos')
-        .where('txid', '==', txidSeguro)
-        .limit(1)
-        .get();
-
-      if (!pedidoSnap.empty) {
-        pedidoIdSeguro = pedidoSnap.docs[0].id;
-      }
-    }
-
-    if (statusEfi !== 'CONCLUIDA') {
-      await pagamentoRef.set({
-        gateway: 'efi',
-        txid: txidSeguro,
-        pedidoId: pedidoIdSeguro || pagamento.pedidoId || '',
-        status: statusEfi,
-        cobrancaEfi: cob,
-        atualizadoEm: agora(),
-      }, { merge: true });
-
-      return res.json({
-        sucesso: true,
-        confirmado: false,
-        pagamentoId: txidSeguro,
-        txid: txidSeguro,
+    await pagamentoRef.set(
+      {
+        provedor: "efi",
+        txid,
         pedidoId: pedidoIdSeguro,
-        status: statusEfi,
-      });
-    }
-
-    if (!pedidoIdSeguro) {
-      return res.status(400).json({
-        erro: 'Pagamento Efí confirmado, mas pedidoId não foi encontrado',
-        pagamentoId: txidSeguro,
-        txid: txidSeguro,
-        status: statusEfi,
-      });
-    }
-
-    await pagamentoRef.set({
-      gateway: 'efi',
-      txid: txidSeguro,
-      pedidoId: pedidoIdSeguro,
-      status: 'CONCLUIDA',
-      pagamentoStatus: 'pago_bloqueado',
-      pago: true,
-      cobrancaEfi: cob,
-      atualizadoEm: agora(),
-    }, { merge: true });
-
-    await db.collection('pedidos').doc(String(pedidoIdSeguro)).set({
-      pago: true,
-      pagamentoStatus: 'pago_bloqueado',
-      status: 'pago_aguardando_trabalhador',
-      chatLiberado: false,
-      localizacaoLiberada: false,
-      dinheiroRetidoAteConfirmacao: true,
-      pagamentoConfirmadoEm: agora(),
-      atualizadoEm: agora(),
-    }, { merge: true });
-
-    return res.json({
-      sucesso: true,
-      confirmado: true,
-      pagamentoId: txidSeguro,
-      txid: txidSeguro,
-      pedidoId: pedidoIdSeguro,
-      status: 'CONCLUIDA',
-      pagamentoStatus: 'pago_bloqueado',
-    });
-  } catch (e) {
-    console.error('verificarPagamentoManual erro', e?.response?.data || e.message);
-    return res.status(500).json({
-      erro: 'Erro ao verificar pagamento Efí',
-      detalhes: e?.response?.data || e.message,
-    });
-  }
-});
-
-app.post('/trabalhadorEstouIndo', async (req, res) => {
-  try {
-    initFirebase();
-    const db = admin.firestore();
-    const { pedidoId, prestadorId } = req.body || {};
-    if (!pedidoId || !prestadorId) return res.status(400).json({ erro: 'Informe pedidoId e prestadorId' });
-
-    const ref = db.collection('pedidos').doc(String(pedidoId));
-    const doc = await ref.get();
-    if (!doc.exists) return res.status(404).json({ erro: 'Pedido não encontrado' });
-    const pedido = doc.data();
-    if (pedido.prestadorId !== prestadorId) return res.status(403).json({ erro: 'Trabalhador incorreto' });
-    if (pedido.pago !== true) return res.status(400).json({ erro: 'Pedido ainda não foi pago' });
-
-    await ref.set({
-      status: 'trabalhador_a_caminho', trabalhadorClicouEstouIndo: true,
-      chatLiberado: true, localizacaoLiberada: true,
-      trabalhadorEstouIndoEm: agora(), atualizadoEm: agora(),
-    }, { merge: true });
-
-    res.json({ sucesso: true });
-  } catch (e) {
-    res.status(500).json({ erro: 'Erro ao marcar Estou indo', detalhes: e.message });
-  }
-});
-
-app.post('/prestadorFinalizouServico', async (req, res) => {
-  try {
-    initFirebase();
-    const db = admin.firestore();
-    const { pedidoId, prestadorId } = req.body || {};
-    if (!pedidoId || !prestadorId) return res.status(400).json({ erro: 'Informe pedidoId e prestadorId' });
-
-    const ref = db.collection('pedidos').doc(String(pedidoId));
-    const doc = await ref.get();
-    if (!doc.exists) return res.status(404).json({ erro: 'Pedido não encontrado' });
-    const pedido = doc.data();
-    if (pedido.prestadorId !== prestadorId) return res.status(403).json({ erro: 'Trabalhador incorreto' });
-    if (pedido.pago !== true) return res.status(400).json({ erro: 'Pedido ainda não foi pago' });
-
-    await ref.set({
-      status: 'aguardando_confirmacao_cliente',
-      trabalhadorFinalizou: true,
-      servicoFinalizadoPeloPrestador: true,
-      servicoFinalizadoEm: agora(), atualizadoEm: agora(),
-    }, { merge: true });
-
-    res.json({ sucesso: true, mensagem: 'Serviço finalizado. Aguardando confirmação do cliente.' });
-  } catch (e) {
-    res.status(500).json({ erro: 'Erro ao finalizar serviço', detalhes: e.message });
-  }
-});
-
-async function enviarPixParaTrabalhador({ chavePix, valor, descricao }) {
-  const idEnvio = uuidv4().replace(/-/g, '').slice(0, 32);
-  const body = {
-    valor: valor.toFixed(2),
-    pagador: { chave: EFI_CHAVE_PIX_APP },
-    favorecido: { chave: chavePix },
-  };
-  console.log('Body enviado para envio Pix Efi:', body);
-  console.log("Enviando repasse Pix", body);
-  try {
-    const token = await getEfiToken();
-    const client = efiClient();
-    const response = await client.request({
-      method: 'PUT',
-      url: `/v3/gn/pix/${idEnvio}`,
-      data: body,
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    console.log("Resposta Efí:", response.status, response.data);
-    return { idEnvio, data: response.data };
-  } catch (error) {
-    console.error("Erro Efí:", error.response?.status);
-    console.error("Resposta Efí:", error.response?.data);
-    console.error(error.message);
-    throw error;
-  }
-}
-
-async function enviarPixParaTrabalhadorComId({ idEnvio, chavePix, valor, descricao }) {
-  const body = {
-    valor: valor.toFixed(2),
-    pagador: { chave: EFI_CHAVE_PIX_APP },
-    favorecido: { chave: chavePix },
-  };
-  console.log('Body enviado para envio Pix Efi:', body);
-  console.log("Enviando repasse Pix", body);
-  try {
-    const token = await getEfiToken();
-    const client = efiClient();
-    const response = await client.request({
-      method: 'PUT',
-      url: `/v3/gn/pix/${idEnvio}`,
-      data: body,
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    console.log("Resposta Efí:", response.status, response.data);
-    return { idEnvio, data: response.data };
-  } catch (error) {
-    console.error("Erro Efí:", error.response?.status);
-    console.error("Resposta Efí:", error.response?.data);
-    console.error(error.message);
-    throw error;
-  }
-}
-
-app.post('/clienteConfirmouServico', async (req, res) => {
-  try {
-    initFirebase();
-    required('EFI_CHAVE_PIX_APP', EFI_CHAVE_PIX_APP);
-    const db = admin.firestore();
-    const { pedidoId, clienteId } = req.body || {};
-    if (!pedidoId || !clienteId) return res.status(400).json({ erro: 'Informe pedidoId e clienteId' });
-
-    const pedidoRef = db.collection('pedidos').doc(String(pedidoId));
-    const idEnvio = `REP${String(pedidoId).replace(/[^a-zA-Z0-9]/g, '').slice(0, 32)}`;
-    const repasseRef = db.collection('repasses').doc(idEnvio);
-
-    const dadosRepasse = await db.runTransaction(async (transaction) => {
-      const pedidoDoc = await transaction.get(pedidoRef);
-      if (!pedidoDoc.exists) {
-        const erro = new Error('Pedido nao encontrado');
-        erro.status = 404;
-        throw erro;
-      }
-
-      const pedido = pedidoDoc.data();
-      if (pedido.clienteId !== clienteId) {
-        const erro = new Error('Cliente incorreto');
-        erro.status = 403;
-        throw erro;
-      }
-      if (pedido.pago !== true) {
-        const erro = new Error('Pedido ainda nao foi pago');
-        erro.status = 400;
-        throw erro;
-      }
-      if (pedido.pagamentoStatus !== 'pago_bloqueado' && pedido.pagamentoStatus !== 'aguardando_confirmacao_cliente') {
-        const erro = new Error('Pagamento nao esta bloqueado para repasse');
-        erro.status = 400;
-        throw erro;
-      }
-      if (pedido.trabalhadorFinalizou !== true && pedido.servicoFinalizadoPeloPrestador !== true) {
-        const erro = new Error('Trabalhador ainda nao finalizou o servico');
-        erro.status = 400;
-        throw erro;
-      }
-      if (pedido.repasseTrabalhadorStatus === 'concluido' || pedido.pagamentoStatus === 'repasse_concluido') {
-        return { jaConcluido: true, pedido };
-      }
-      if (pedido.repasseTrabalhadorStatus === 'processando') {
-        const erro = new Error('Repasse ja esta em processamento');
-        erro.status = 409;
-        throw erro;
-      }
-
-      const valorTotal = dinheiro2(pedido.valorTotal || pedido.valorServico || 0);
-      if (!valorTotal || valorTotal <= 0) {
-        const erro = new Error('Pedido sem valor para repasse');
-        erro.status = 400;
-        throw erro;
-      }
-
-      const comissaoApp = dinheiro2(valorTotal * APP_COMISSAO);
-      const valorTrabalhador = dinheiro2(valorTotal - comissaoApp);
-      const prestadorId = pedido.prestadorId || pedido.aceitoPor;
-      if (!prestadorId) {
-        const erro = new Error('Pedido sem trabalhador definido');
-        erro.status = 400;
-        throw erro;
-      }
-
-      transaction.set(pedidoRef, {
-        status: 'concluido_processando_repasse',
-        clienteConfirmouServico: true,
-        clienteConfirmouFinalizacao: true,
-        clienteConfirmouEm: agora(),
-        repasseTrabalhadorStatus: 'processando',
-        repasseTrabalhadorIdEnvio: idEnvio,
+        clienteId: clienteIdSeguro,
+        prestadorId: prestadorIdSeguro,
+        emailCliente: emailSeguro,
         valorTotal,
         comissaoApp,
-        valorTrabalhador,
-        valorPrestador: valorTrabalhador,
-        atualizadoEm: agora(),
-      }, { merge: true });
-
-      transaction.set(repasseRef, {
-        pedidoId: String(pedidoId),
-        clienteId,
-        prestadorId,
-        valorTotal,
-        comissaoApp,
-        valorTrabalhador,
-        gateway: 'efi',
-        efiIdEnvio: idEnvio,
-        status: 'processando',
+        valorPrestador,
+        status: cobranca.status || "ATIVA",
+        qrCode: qr.qrcode || "",
+        qrCodeBase64: qr.imagemQrcode || "",
+        ticketUrl: qr.linkVisualizacao || "",
+        cobrancaEfi: cobranca,
         criadoEm: agora(),
         atualizadoEm: agora(),
-      }, { merge: true });
+        expiraEm,
+      },
+      { merge: true }
+    );
 
-      return { pedido, prestadorId, valorTotal, comissaoApp, valorTrabalhador };
+    await db.collection("pedidos").doc(pedidoIdSeguro).set(
+      {
+        pagamentoId: txid,
+        provedorPagamento: "efi",
+        txidEfi: txid,
+        pagamentoStatus: "pending",
+        pago: false,
+        status: "aguardando_pagamento",
+        clienteId: clienteIdSeguro,
+        prestadorId: prestadorIdSeguro,
+        valorTotal,
+        comissaoApp,
+        valorPrestador,
+        chatLiberado: false,
+        localizacaoLiberada: false,
+        dinheiroRetidoAteConfirmacao: true,
+        atualizadoEm: agora(),
+        pagamentoExpiraEm: expiraEm,
+      },
+      { merge: true }
+    );
+
+    return res.status(200).json({
+      sucesso: true,
+      provedor: "efi",
+      pagamentoId: txid,
+      txid,
+      status: "pending",
+      valorTotal,
+      comissaoApp,
+      valorPrestador,
+      qrCode: qr.qrcode || "",
+      qrCodeBase64: qr.imagemQrcode || "",
+      ticketUrl: qr.linkVisualizacao || "",
     });
-
-    if (dadosRepasse.jaConcluido) {
-      return res.json({ sucesso: true, mensagem: 'Servico ja confirmado e repasse ja concluido.' });
-    }
-
-    const { prestadorId, valorTotal, comissaoApp, valorTrabalhador } = dadosRepasse;
-    const userDoc = await db.collection('usuarios').doc(String(prestadorId)).get();
-    const trabalhador = userDoc.data() || {};
-    const chavePix = String(trabalhador.chavePix || trabalhador.pix || trabalhador.pixChave || '').trim();
-    if (!chavePix) return res.status(400).json({ erro: 'Trabalhador nao possui chave Pix cadastrada.' });
-
-    const repasse = await enviarPixParaTrabalhadorComId({
-      idEnvio,
-      chavePix,
-      valor: valorTrabalhador,
-      descricao: `Repasse pedido ${pedidoId} - Faz Pra Mim`,
-    });
-
-    await repasseRef.set({
-      pedidoId: String(pedidoId), clienteId, prestadorId,
-      valorTotal, comissaoApp, valorTrabalhador,
-      chavePixTrabalhador: chavePix,
-      gateway: 'efi', status: 'concluido',
-      efiIdEnvio: repasse.idEnvio,
-      efiResposta: repasse.data,
-      atualizadoEm: agora(),
-    }, { merge: true });
-
-    await pedidoRef.set({
-      status: 'concluido',
-      pagamentoStatus: 'repasse_concluido',
-      dinheiroRetidoAteConfirmacao: false,
-      repasseTrabalhadorStatus: 'concluido',
-      repasseTrabalhadorIdEnvio: repasse.idEnvio,
-      repasseTrabalhadorEm: agora(),
-      servicoConcluido: true,
-      avaliacaoPendente: true,
-      finalizadoEm: agora(),
-      concluidoEm: agora(),
-      valorTotal, comissaoApp, valorTrabalhador,
-      valorPrestador: valorTrabalhador,
-      atualizadoEm: agora(),
-    }, { merge: true });
-
-    await criarNotificacao(db, prestadorId, 'Pagamento recebido', `Seu repasse de R$ ${valorTrabalhador.toFixed(2).replace('.', ',')} foi enviado por Pix.`, 'repasse_concluido', String(pedidoId));
-
-    res.json({ sucesso: true, mensagem: 'Servico confirmado e repasse enviado.', valorTotal, comissaoApp, valorTrabalhador });
   } catch (e) {
-    console.error('clienteConfirmouServico erro', e?.response?.data || e.message);
-    try {
-      if (req.body?.pedidoId) {
-        await admin.firestore().collection('pedidos').doc(String(req.body.pedidoId)).set({
-          repasseTrabalhadorStatus: 'erro',
-          repasseTrabalhadorErro: JSON.stringify(e?.response?.data || e.message).slice(0, 900),
-          atualizadoEm: agora(),
-        }, { merge: true });
-      }
-    } catch (_) {}
-    res.status(e.status || 500).json({ erro: 'Erro ao confirmar servico ou enviar Pix', detalhes: e?.response?.data || e.message });
+    console.error("Erro ao criar Pix Efí:", e);
+    const status = Number(e.status || 500);
+    return res.status(status >= 400 && status < 600 ? status : 500).json({
+      erro: "Erro ao criar Pix Efí",
+      detalhes: e.message,
+    });
   }
 });
-app.listen(PORT, () => console.log(`Faz Pra Mim Efí backend rodando na porta ${PORT}`));
+
+app.post("/cadastrarWebhookPixEfi", async (req, res) => {
+  try {
+    const cfg = validarEfiConfig();
+    exigirChavePixEfi(cfg);
+
+    const webhookUrl = urlWebhookPixEfiComIgnorar(
+      req.body?.webhookUrl || cfg.webhookPixUrl
+    );
+
+    const resultado = await efiRequest(
+      "PUT",
+      `/v2/webhook/${encodeURIComponent(cfg.chavePixApp)}`,
+      { webhookUrl },
+      { "x-skip-mtls-checking": "true" }
+    );
+
+    return res.status(200).json({
+      sucesso: true,
+      webhookUrl,
+      resultado,
+    });
+  } catch (e) {
+    console.error("Erro ao cadastrar webhook Pix EfÃ­:", e);
+    return res.status(500).json({
+      sucesso: false,
+      erro: "Erro ao cadastrar webhook Pix EfÃ­",
+      detalhes: e.message,
+    });
+  }
+});
+
+async function localizarPagamentoEfi(txid, pedidoIdInformado) {
+  const txidSeguro = String(txid || "").trim();
+  const pagamentoRef = db.collection("pagamentos").doc(txidSeguro);
+  const pagamentoDoc = await pagamentoRef.get();
+
+  if (pagamentoDoc.exists) {
+    const pagamento = pagamentoDoc.data() || {};
+    return {
+      pagamentoRef,
+      pagamento,
+      pedidoId: pagamento.pedidoId || pedidoIdInformado || "",
+    };
+  }
+
+  if (pedidoIdInformado) {
+    return {
+      pagamentoRef,
+      pagamento: { pedidoId: pedidoIdInformado },
+      pedidoId: pedidoIdInformado,
+    };
+  }
+
+  const pedidoSnap = await db
+    .collection("pedidos")
+    .where("txidEfi", "==", txidSeguro)
+    .limit(1)
+    .get();
+
+  if (pedidoSnap.empty) {
+    return { pagamentoRef, pagamento: {}, pedidoId: "" };
+  }
+
+  const pedidoDoc = pedidoSnap.docs[0];
+  const pedido = pedidoDoc.data() || {};
+
+  return {
+    pagamentoRef,
+    pagamento: {
+      pedidoId: pedidoDoc.id,
+      clienteId: pedido.clienteId || "",
+      prestadorId: pedido.prestadorId || pedido.aceitoPor || "",
+      valorTotal: pedido.valorTotal || pedido.valorServico || 0,
+      comissaoApp: pedido.comissaoApp || 0,
+      valorPrestador: pedido.valorPrestador || 0,
+    },
+    pedidoId: pedidoDoc.id,
+  };
+}
+
+async function confirmarPagamentoEfi(txid, pedidoIdInformado) {
+  const txidSeguro = String(txid || "").trim();
+
+  if (!txidSeguro) {
+    return { confirmado: false, erro: "txid ausente" };
+  }
+
+  const cobrancaAtual = await efiRequest("GET", `/v2/cob/${txidSeguro}`);
+  const statusEfi = String(cobrancaAtual.status || "");
+  const { pagamentoRef, pagamento, pedidoId } = await localizarPagamentoEfi(
+    txidSeguro,
+    pedidoIdInformado
+  );
+
+  if (statusEfi !== "CONCLUIDA") {
+    await pagamentoRef.set({
+      ...pagamento,
+      provedor: "efi",
+      txid: txidSeguro,
+      pedidoId: pedidoId || pedidoIdInformado || "",
+      status: statusEfi,
+      cobrancaEfiConfirmada: cobrancaAtual,
+      atualizadoEm: agora(),
+    }, { merge: true });
+
+    return {
+      confirmado: false,
+      txid: txidSeguro,
+      pedidoId: pedidoId || pedidoIdInformado || "",
+      status: statusEfi,
+    };
+  }
+
+  if (!pedidoId) {
+    return {
+      confirmado: false,
+      txid: txidSeguro,
+      status: statusEfi,
+      erro: "Pagamento Efí sem pedidoId",
+    };
+  }
+
+  await pagamentoRef.set({
+    ...pagamento,
+    provedor: "efi",
+    txid: txidSeguro,
+    pedidoId,
+    status: "CONCLUIDA",
+    pagamentoStatus: "pago_bloqueado",
+    pago: true,
+    cobrancaEfiConfirmada: cobrancaAtual,
+    atualizadoEm: agora(),
+  }, { merge: true });
+
+  await db.collection("pedidos").doc(String(pedidoId)).set({
+    pago: true,
+    pagamentoStatus: "pago_bloqueado",
+    status: "pago_aguardando_trabalhador",
+    chatLiberado: false,
+    localizacaoLiberada: false,
+    dinheiroRetidoAteConfirmacao: true,
+    pagamentoConfirmadoEm: agora(),
+    atualizadoEm: agora(),
+  }, { merge: true });
+
+  return {
+    confirmado: true,
+    txid: txidSeguro,
+    pedidoId,
+    status: "CONCLUIDA",
+    pagamentoStatus: "pago_bloqueado",
+  };
+}
+
+app.post(["/webhookPixEfi", "/webhookPixEfi/pix"], async (req, res) => {
+  try {
+    const pixRecebidos = Array.isArray(req.body?.pix) ? req.body.pix : [];
+
+    for (const pix of pixRecebidos) {
+      const txid = String(pix.txid || "").trim();
+      if (!txid) continue;
+
+      const resultado = await confirmarPagamentoEfi(txid);
+
+      if (!resultado.confirmado) {
+        console.warn("Webhook Pix Efi ignorado; cobranca nao confirmada.", {
+          txid,
+          status: resultado.status || "",
+          erro: resultado.erro || "",
+        });
+      }
+    }
+
+    return res.status(200).send("Webhook Pix Efi processado");
+  } catch (e) {
+    console.error("Erro webhook Pix Efi:", e);
+    return res.status(200).send("Erro interno webhook Pix Efi");
+  }
+});
+
+app.post("/verificarPagamentoManual", async (req, res) => {
+  try {
+    const { pagamentoId, txid, pedidoId } = req.body || {};
+    const txidSeguro = String(txid || pagamentoId || "").trim();
+    const pedidoIdSeguro = String(pedidoId || "").trim();
+
+    if (!txidSeguro) {
+      return res.status(400).json({
+        sucesso: false,
+        erro: "Informe pagamentoId ou txid",
+      });
+    }
+
+    const resultado = await confirmarPagamentoEfi(txidSeguro, pedidoIdSeguro);
+
+    if (resultado.erro) {
+      return res.status(400).json({
+        sucesso: false,
+        ...resultado,
+      });
+    }
+
+    return res.status(200).json({
+      sucesso: true,
+      pagamentoId: txidSeguro,
+      ...resultado,
+    });
+  } catch (e) {
+    console.error("Erro ao verificar pagamento Efí:", e);
+    return res.status(500).json({
+      sucesso: false,
+      erro: "Erro ao verificar pagamento Efí",
+      detalhes: e.message,
+    });
+  }
+});
+
+app.post("/clienteConfirmouServico", async (req, res) => {
+  const { pedidoId, clienteId } = req.body || {};
+  const pedidoIdSeguro = normalizarId(pedidoId);
+  let pedidoRef = null;
+  let idEnvio = "";
+
+  try {
+    const decoded = await verificarUsuarioPeloToken(req);
+
+    if (!pedidoIdSeguro || !clienteId) {
+      return res.status(400).json({ erro: "Dados obrigatorios faltando" });
+    }
+
+    const carregado = await carregarPedidoAutorizado(
+      pedidoIdSeguro,
+      decoded,
+      "cliente"
+    );
+    pedidoRef = carregado.pedidoRef;
+    const pedido = carregado.pedido;
+    const clienteIdSeguro = pedido.clienteId;
+
+    if (clienteId && clienteId !== clienteIdSeguro) {
+      return res.status(403).json({ erro: "Cliente incorreto" });
+    }
+
+    if (pedido.pago !== true || pedido.pagamentoStatus !== "pago_bloqueado") {
+      return res.status(400).json({
+        erro: "Pedido ainda nao possui pagamento Pix confirmado e bloqueado.",
+      });
+    }
+
+    if (pedido.trabalhadorFinalizou !== true) {
+      return res.status(400).json({
+        erro: "Aguarde o trabalhador marcar que terminou o servico.",
+      });
+    }
+
+    if (pedido.repassePrestadorStatus === "concluido") {
+      return res.status(200).json({
+        sucesso: true,
+        mensagem: "Repasse ja concluido.",
+        idEnvio: pedido.repassePrestadorIdEnvio || "",
+      });
+    }
+
+    const prestadorId = pedido.prestadorId || pedido.aceitoPor || "";
+    const prestadorDoc = prestadorId
+      ? await db.collection("usuarios").doc(String(prestadorId)).get()
+      : null;
+    const prestador =
+      prestadorDoc && prestadorDoc.exists ? prestadorDoc.data() || {} : {};
+    const chavePixTrabalhador = String(
+      pedido.prestadorPix ||
+        prestador.pix ||
+        prestador.chavePix ||
+        prestador.chave_pix ||
+        ""
+    ).trim();
+
+    if (!prestadorId) {
+      return res.status(400).json({ erro: "Pedido sem trabalhador vinculado." });
+    }
+
+    if (!chavePixTrabalhador) {
+      const erroSemPix = {
+        message: "Trabalhador sem chave Pix cadastrada.",
+        code: "TRABALHADOR_SEM_PIX",
+      };
+      await pedidoRef.set(
+        {
+          status: "concluido",
+          pagamentoStatus: "repasse_erro",
+          repassePrestadorStatus: "erro_sem_pix",
+          repassePrestadorMensagem: erroSemPix.message,
+          repassePrestadorErro: erroSemPix,
+          dinheiroRetidoAteConfirmacao: false,
+          clienteConfirmouServico: true,
+          clienteConfirmouFinalizacao: true,
+          clienteConfirmouEm: agora(),
+          atualizadoEm: agora(),
+        },
+        { merge: true }
+      );
+      return res.status(400).json({ erro: erroSemPix.message });
+    }
+
+    const valorTotal = Number(pedido.valorTotal || valorDoPedido(pedido));
+    const comissaoApp = Number(
+      pedido.comissaoApp || (valorTotal * 0.1).toFixed(2)
+    );
+    const valorPrestador = Number(
+      pedido.valorPrestador || (valorTotal - comissaoApp).toFixed(2)
+    );
+
+    if (!Number.isFinite(valorPrestador) || valorPrestador <= 0) {
+      return res.status(400).json({ erro: "Valor do repasse invalido." });
+    }
+
+    const cfg = validarEfiConfig();
+    exigirChavePixEfi(cfg);
+    idEnvio = idEnvioDoPedido(pedidoIdSeguro);
+
+    console.log("Cliente confirmou servico; preparando repasse Pix Efí.", {
+      pedidoId: pedidoIdSeguro,
+      clienteId: clienteIdSeguro,
+      prestadorId,
+      idEnvio,
+      valorTotal,
+      comissaoApp,
+      valorPrestador,
+    });
+
+    await db.runTransaction(async (transaction) => {
+      const snap = await transaction.get(pedidoRef);
+      const dados = snap.data() || {};
+
+      if (dados.repassePrestadorStatus === "concluido") {
+        throw new Error("REPASSE_JA_CONCLUIDO");
+      }
+
+      if (dados.repassePrestadorStatus === "processando") {
+        throw new Error("REPASSE_EM_PROCESSAMENTO");
+      }
+
+      if (dados.pago !== true || dados.pagamentoStatus !== "pago_bloqueado") {
+        throw new Error("PAGAMENTO_NAO_BLOQUEADO");
+      }
+
+      if (dados.trabalhadorFinalizou !== true) {
+        throw new Error("SERVICO_NAO_FINALIZADO_PELO_TRABALHADOR");
+      }
+
+      transaction.set(
+        pedidoRef,
+        {
+          status: "concluido",
+          pagamentoStatus: "repasse_processando",
+          dinheiroRetidoAteConfirmacao: false,
+          clienteConfirmouServico: true,
+          clienteConfirmouFinalizacao: true,
+          clienteConfirmouEm: agora(),
+          valorTotal,
+          comissaoApp,
+          valorPrestador,
+          repassePrestadorStatus: "processando",
+          repassePrestadorIdEnvio: idEnvio,
+          repassePrestadorSolicitadoEm: agora(),
+          atualizadoEm: agora(),
+        },
+        { merge: true }
+      );
+    });
+
+    await db.collection("repasses").doc(idEnvio).set(
+      {
+        pedidoId: pedidoIdSeguro,
+        clienteId: clienteIdSeguro,
+        prestadorId,
+        chavePixTrabalhador,
+        valorTotal,
+        comissaoApp,
+        valorPrestador,
+        provedor: "efi",
+        idEnvio,
+        status: "processando",
+        criadoEm: agora(),
+        atualizadoEm: agora(),
+      },
+      { merge: true }
+    );
+
+    const envio = await efiRequest("PUT", `/v2/gn/pix/${idEnvio}`, {
+      valor: somenteDinheiro(valorPrestador),
+      pagador: {
+        chave: cfg.chavePixApp,
+        infoPagador: `Repasse Faz Pra Mim pedido ${pedidoIdSeguro}`.slice(
+          0,
+          140
+        ),
+      },
+      favorecido: { chave: chavePixTrabalhador },
+    });
+
+    console.log("Repasse Pix Efí concluido.", {
+      pedidoId: pedidoIdSeguro,
+      idEnvio,
+      endToEndId: envio.endToEndId || envio.e2eId || "",
+    });
+
+    const comprovante = {
+      idEnvio,
+      endToEndId: envio.endToEndId || envio.e2eId || "",
+      horario: envio.horario || envio.criadoEm || "",
+      valor: somenteDinheiro(valorPrestador),
+      favorecido: envio.favorecido || null,
+      dadosEfi: envio,
+    };
+
+    await pedidoRef.set(
+      {
+        pagamentoStatus: "repasse_concluido",
+        repassePrestadorStatus: "concluido",
+        repassePrestadorMensagem: "Repasse automatico Pix enviado pela Efí.",
+        repassePrestadorDadosEfi: envio,
+        repassePrestadorComprovante: comprovante,
+        repassePrestadorEm: agora(),
+        atualizadoEm: agora(),
+      },
+      { merge: true }
+    );
+
+    await db.collection("repasses").doc(idEnvio).set(
+      {
+        status: "concluido",
+        dadosEfi: envio,
+        comprovante,
+        concluidoEm: agora(),
+        atualizadoEm: agora(),
+      },
+      { merge: true }
+    );
+
+    await criarNotificacao(
+      prestadorId,
+      "Repasse enviado",
+      `Seu repasse de R$ ${valorPrestador
+        .toFixed(2)
+        .replace(".", ",")} foi enviado via Pix.`,
+      "repasse_enviado",
+      pedidoIdSeguro
+    );
+
+    return res.status(200).json({
+      sucesso: true,
+      mensagem: "Servico confirmado. Repasse Pix enviado automaticamente.",
+      valorTotal,
+      comissaoApp,
+      valorPrestador,
+      idEnvio,
+      comprovante,
+    });
+  } catch (e) {
+    console.error("Erro ao confirmar servico e repassar Pix:", e);
+
+    if (String(e.message).includes("REPASSE_JA_CONCLUIDO")) {
+      return res.status(200).json({
+        sucesso: true,
+        mensagem: "Repasse ja concluido.",
+        idEnvio,
+      });
+    }
+
+    if (String(e.message).includes("REPASSE_EM_PROCESSAMENTO")) {
+      return res.status(409).json({
+        erro: "Repasse ja esta em processamento. Aguarde.",
+        idEnvio,
+      });
+    }
+
+    const status = Number(e.status || 500);
+    const erroEfi = erroPublicoEfi(e);
+
+    if (pedidoIdSeguro) {
+      const erroPersistido = {
+        ...erroEfi,
+        code: String(e.message || "").includes("PAGAMENTO_NAO_BLOQUEADO")
+          ? "PAGAMENTO_NAO_BLOQUEADO"
+          : String(e.message || "").includes(
+              "SERVICO_NAO_FINALIZADO_PELO_TRABALHADOR"
+            )
+            ? "SERVICO_NAO_FINALIZADO_PELO_TRABALHADOR"
+            : "ERRO_REPASSE_PIX_EFI",
+      };
+
+      await db.collection("pedidos").doc(pedidoIdSeguro).set(
+        {
+          repassePrestadorStatus: "erro",
+          repassePrestadorMensagem: erroPersistido.mensagem,
+          repassePrestadorErro: erroPersistido,
+          pagamentoStatus: "repasse_erro",
+          atualizadoEm: agora(),
+        },
+        { merge: true }
+      );
+
+      if (idEnvio) {
+        await db.collection("repasses").doc(idEnvio).set(
+          {
+            pedidoId: pedidoIdSeguro,
+            provedor: "efi",
+            idEnvio,
+            status: "erro",
+            erro: erroPersistido,
+            atualizadoEm: agora(),
+          },
+          { merge: true }
+        );
+      }
+    }
+
+    return res.status(status >= 400 && status < 600 ? status : 500).json({
+      erro: "Servico confirmado, mas houve erro ao enviar Pix automatico.",
+      detalhes: erroEfi,
+      idEnvio,
+    });
+  }
+});
+
+const port = process.env.PORT || 3000;
+
+if (require.main === module) {
+  app.listen(port, () => {
+    console.log(`Backend Render ouvindo na porta ${port}`);
+  });
+}
+
+module.exports = app;

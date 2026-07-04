@@ -381,7 +381,18 @@ async function enviarPixParaTrabalhador({ chavePix, valor, descricao }) {
     favorecido: { chave: chavePix },
     infoPagador: descricao || 'Repasse Faz Pra Mim',
   };
-  const data = await efiRequest('PUT', `/v2/gn/pix/${idEnvio}`, body);
+  const data = await efiRequest('PUT', `/v3/gn/pix/${idEnvio}`, body);
+  return { idEnvio, data };
+}
+
+async function enviarPixParaTrabalhadorComId({ idEnvio, chavePix, valor, descricao }) {
+  const body = {
+    valor: valor.toFixed(2),
+    pagador: { chave: EFI_CHAVE_PIX_APP },
+    favorecido: { chave: chavePix },
+    infoPagador: descricao || 'Repasse Faz Pra Mim',
+  };
+  const data = await efiRequest('PUT', `/v3/gn/pix/${idEnvio}`, body);
   return { idEnvio, data };
 }
 
@@ -394,66 +405,140 @@ app.post('/clienteConfirmouServico', async (req, res) => {
     if (!pedidoId || !clienteId) return res.status(400).json({ erro: 'Informe pedidoId e clienteId' });
 
     const pedidoRef = db.collection('pedidos').doc(String(pedidoId));
-    const pedidoDoc = await pedidoRef.get();
-    if (!pedidoDoc.exists) return res.status(404).json({ erro: 'Pedido não encontrado' });
-    const pedido = pedidoDoc.data();
-    if (pedido.clienteId !== clienteId) return res.status(403).json({ erro: 'Cliente incorreto' });
-    if (pedido.pago !== true) return res.status(400).json({ erro: 'Pedido ainda não foi pago' });
-    if (pedido.trabalhadorFinalizou !== true && pedido.servicoFinalizadoPeloPrestador !== true) {
-      return res.status(400).json({ erro: 'Trabalhador ainda não finalizou o serviço' });
-    }
-    if (pedido.repasseTrabalhadorStatus === 'concluido') {
-      return res.json({ sucesso: true, mensagem: 'Serviço já confirmado e repasse já concluído.' });
+    const idEnvio = `REP${String(pedidoId).replace(/[^a-zA-Z0-9]/g, '').slice(0, 32)}`;
+    const repasseRef = db.collection('repasses').doc(idEnvio);
+
+    const dadosRepasse = await db.runTransaction(async (transaction) => {
+      const pedidoDoc = await transaction.get(pedidoRef);
+      if (!pedidoDoc.exists) {
+        const erro = new Error('Pedido nao encontrado');
+        erro.status = 404;
+        throw erro;
+      }
+
+      const pedido = pedidoDoc.data();
+      if (pedido.clienteId !== clienteId) {
+        const erro = new Error('Cliente incorreto');
+        erro.status = 403;
+        throw erro;
+      }
+      if (pedido.pago !== true) {
+        const erro = new Error('Pedido ainda nao foi pago');
+        erro.status = 400;
+        throw erro;
+      }
+      if (pedido.pagamentoStatus !== 'pago_bloqueado' && pedido.pagamentoStatus !== 'aguardando_confirmacao_cliente') {
+        const erro = new Error('Pagamento nao esta bloqueado para repasse');
+        erro.status = 400;
+        throw erro;
+      }
+      if (pedido.trabalhadorFinalizou !== true && pedido.servicoFinalizadoPeloPrestador !== true) {
+        const erro = new Error('Trabalhador ainda nao finalizou o servico');
+        erro.status = 400;
+        throw erro;
+      }
+      if (pedido.repasseTrabalhadorStatus === 'concluido' || pedido.pagamentoStatus === 'repasse_concluido') {
+        return { jaConcluido: true, pedido };
+      }
+      if (pedido.repasseTrabalhadorStatus === 'processando') {
+        const erro = new Error('Repasse ja esta em processamento');
+        erro.status = 409;
+        throw erro;
+      }
+
+      const valorTotal = dinheiro2(pedido.valorTotal || pedido.valorServico || 0);
+      if (!valorTotal || valorTotal <= 0) {
+        const erro = new Error('Pedido sem valor para repasse');
+        erro.status = 400;
+        throw erro;
+      }
+
+      const comissaoApp = dinheiro2(valorTotal * APP_COMISSAO);
+      const valorTrabalhador = dinheiro2(valorTotal - comissaoApp);
+      const prestadorId = pedido.prestadorId || pedido.aceitoPor;
+      if (!prestadorId) {
+        const erro = new Error('Pedido sem trabalhador definido');
+        erro.status = 400;
+        throw erro;
+      }
+
+      transaction.set(pedidoRef, {
+        status: 'concluido_processando_repasse',
+        clienteConfirmouServico: true,
+        clienteConfirmouFinalizacao: true,
+        clienteConfirmouEm: agora(),
+        repasseTrabalhadorStatus: 'processando',
+        repasseTrabalhadorIdEnvio: idEnvio,
+        valorTotal,
+        comissaoApp,
+        valorTrabalhador,
+        valorPrestador: valorTrabalhador,
+        atualizadoEm: agora(),
+      }, { merge: true });
+
+      transaction.set(repasseRef, {
+        pedidoId: String(pedidoId),
+        clienteId,
+        prestadorId,
+        valorTotal,
+        comissaoApp,
+        valorTrabalhador,
+        gateway: 'efi',
+        efiIdEnvio: idEnvio,
+        status: 'processando',
+        criadoEm: agora(),
+        atualizadoEm: agora(),
+      }, { merge: true });
+
+      return { pedido, prestadorId, valorTotal, comissaoApp, valorTrabalhador };
+    });
+
+    if (dadosRepasse.jaConcluido) {
+      return res.json({ sucesso: true, mensagem: 'Servico ja confirmado e repasse ja concluido.' });
     }
 
-    const prestadorId = pedido.prestadorId;
+    const { prestadorId, valorTotal, comissaoApp, valorTrabalhador } = dadosRepasse;
     const userDoc = await db.collection('usuarios').doc(String(prestadorId)).get();
     const trabalhador = userDoc.data() || {};
-    const chavePix = String(trabalhador.chavePix || trabalhador.pix || '').trim();
-    if (!chavePix) return res.status(400).json({ erro: 'Trabalhador não possui chave Pix cadastrada.' });
+    const chavePix = String(trabalhador.chavePix || trabalhador.pix || trabalhador.pixChave || '').trim();
+    if (!chavePix) return res.status(400).json({ erro: 'Trabalhador nao possui chave Pix cadastrada.' });
 
-    const valorTotal = dinheiro2(pedido.valorTotal || 0);
-    const comissaoApp = dinheiro2(pedido.comissaoApp || valorTotal * APP_COMISSAO);
-    const valorTrabalhador = dinheiro2(pedido.valorTrabalhador || pedido.valorPrestador || (valorTotal - comissaoApp));
-
-    await pedidoRef.set({
-      status: 'concluido_processando_repasse',
-      clienteConfirmouServico: true,
-      clienteConfirmouFinalizacao: true,
-      clienteConfirmouEm: agora(),
-      repasseTrabalhadorStatus: 'processando',
-      atualizadoEm: agora(),
-    }, { merge: true });
-
-    const repasse = await enviarPixParaTrabalhador({
+    const repasse = await enviarPixParaTrabalhadorComId({
+      idEnvio,
       chavePix,
       valor: valorTrabalhador,
       descricao: `Repasse pedido ${pedidoId} - Faz Pra Mim`,
     });
 
-    await db.collection('repasses').add({
+    await repasseRef.set({
       pedidoId: String(pedidoId), clienteId, prestadorId,
       valorTotal, comissaoApp, valorTrabalhador,
       chavePixTrabalhador: chavePix,
       gateway: 'efi', status: 'concluido',
       efiIdEnvio: repasse.idEnvio,
       efiResposta: repasse.data,
-      criadoEm: agora(), atualizadoEm: agora(),
-    });
+      atualizadoEm: agora(),
+    }, { merge: true });
 
     await pedidoRef.set({
       status: 'concluido',
       pagamentoStatus: 'repasse_concluido',
       dinheiroRetidoAteConfirmacao: false,
       repasseTrabalhadorStatus: 'concluido',
+      repasseTrabalhadorIdEnvio: repasse.idEnvio,
       repasseTrabalhadorEm: agora(),
+      servicoConcluido: true,
+      avaliacaoPendente: true,
+      finalizadoEm: agora(),
+      concluidoEm: agora(),
       valorTotal, comissaoApp, valorTrabalhador,
+      valorPrestador: valorTrabalhador,
       atualizadoEm: agora(),
     }, { merge: true });
 
     await criarNotificacao(db, prestadorId, 'Pagamento recebido', `Seu repasse de R$ ${valorTrabalhador.toFixed(2).replace('.', ',')} foi enviado por Pix.`, 'repasse_concluido', String(pedidoId));
 
-    res.json({ sucesso: true, mensagem: 'Serviço confirmado e repasse enviado.', valorTotal, comissaoApp, valorTrabalhador });
+    res.json({ sucesso: true, mensagem: 'Servico confirmado e repasse enviado.', valorTotal, comissaoApp, valorTrabalhador });
   } catch (e) {
     console.error('clienteConfirmouServico erro', e?.response?.data || e.message);
     try {
@@ -465,8 +550,7 @@ app.post('/clienteConfirmouServico', async (req, res) => {
         }, { merge: true });
       }
     } catch (_) {}
-    res.status(500).json({ erro: 'Erro ao confirmar serviço ou enviar Pix', detalhes: e?.response?.data || e.message });
+    res.status(e.status || 500).json({ erro: 'Erro ao confirmar servico ou enviar Pix', detalhes: e?.response?.data || e.message });
   }
 });
-
 app.listen(PORT, () => console.log(`Faz Pra Mim Efí backend rodando na porta ${PORT}`));

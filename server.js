@@ -220,6 +220,106 @@ app.post('/webhookPixEfi', async (req, res) => {
   }
 });
 
+app.post('/verificarPagamentoManual', async (req, res) => {
+  try {
+    initFirebase();
+    const db = admin.firestore();
+    const { pagamentoId, txid, pedidoId } = req.body || {};
+    const txidSeguro = String(txid || pagamentoId || '').trim();
+    const pedidoIdInformado = String(pedidoId || '').trim();
+
+    if (!txidSeguro) {
+      return res.status(400).json({ erro: 'Informe pagamentoId ou txid' });
+    }
+
+    const cob = await efiRequest('GET', `/v2/cob/${txidSeguro}`);
+    const statusEfi = String(cob.status || '');
+    const pagamentoRef = db.collection('pagamentos').doc(txidSeguro);
+    const pagamentoDoc = await pagamentoRef.get();
+    const pagamento = pagamentoDoc.data() || {};
+    let pedidoIdSeguro = String(pagamento.pedidoId || pedidoIdInformado || '').trim();
+
+    if (!pedidoIdSeguro) {
+      const pedidoSnap = await db
+        .collection('pedidos')
+        .where('txid', '==', txidSeguro)
+        .limit(1)
+        .get();
+
+      if (!pedidoSnap.empty) {
+        pedidoIdSeguro = pedidoSnap.docs[0].id;
+      }
+    }
+
+    if (statusEfi !== 'CONCLUIDA') {
+      await pagamentoRef.set({
+        gateway: 'efi',
+        txid: txidSeguro,
+        pedidoId: pedidoIdSeguro || pagamento.pedidoId || '',
+        status: statusEfi,
+        cobrancaEfi: cob,
+        atualizadoEm: agora(),
+      }, { merge: true });
+
+      return res.json({
+        sucesso: true,
+        confirmado: false,
+        pagamentoId: txidSeguro,
+        txid: txidSeguro,
+        pedidoId: pedidoIdSeguro,
+        status: statusEfi,
+      });
+    }
+
+    if (!pedidoIdSeguro) {
+      return res.status(400).json({
+        erro: 'Pagamento Efí confirmado, mas pedidoId não foi encontrado',
+        pagamentoId: txidSeguro,
+        txid: txidSeguro,
+        status: statusEfi,
+      });
+    }
+
+    await pagamentoRef.set({
+      gateway: 'efi',
+      txid: txidSeguro,
+      pedidoId: pedidoIdSeguro,
+      status: 'CONCLUIDA',
+      pagamentoStatus: 'pago_bloqueado',
+      pago: true,
+      cobrancaEfi: cob,
+      atualizadoEm: agora(),
+    }, { merge: true });
+
+    await db.collection('pedidos').doc(String(pedidoIdSeguro)).set({
+      pago: true,
+      pagamentoStatus: 'pago_bloqueado',
+      status: 'pago_aguardando_trabalhador',
+      chatLiberado: false,
+      localizacaoLiberada: false,
+      dinheiroRetidoAteConfirmacao: true,
+      pagamentoConfirmadoEm: agora(),
+      atualizadoEm: agora(),
+    }, { merge: true });
+
+    return res.json({
+      sucesso: true,
+      confirmado: true,
+      pagamentoId: txidSeguro,
+      txid: txidSeguro,
+      pedidoId: pedidoIdSeguro,
+      status: 'CONCLUIDA',
+      pagamentoStatus: 'pago_bloqueado',
+    });
+  } catch (e) {
+    console.error('verificarPagamentoManual erro', e?.response?.data || e.message);
+    return res.status(500).json({
+      erro: 'Erro ao verificar pagamento Efí',
+      detalhes: e?.response?.data || e.message,
+    });
+  }
+});
+
 app.post('/trabalhadorEstouIndo', async (req, res) => {
   try {
     initFirebase();

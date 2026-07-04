@@ -87,7 +87,7 @@ async function getEfiToken() {
   return tokenCache.token;
 }
 
-async function efiRequest(method, path, body) {
+async function efiRequest(method, path, body, extraHeaders = {}) {
   const token = await getEfiToken();
   const client = efiClient();
   try {
@@ -95,7 +95,7 @@ async function efiRequest(method, path, body) {
       method,
       url: path,
       data: body,
-      headers: { Authorization: `Bearer ${token}` },
+      headers: { Authorization: `Bearer ${token}`, ...extraHeaders },
     });
     return resp.data;
   } catch (e) {
@@ -109,6 +109,13 @@ async function efiRequest(method, path, body) {
     });
     throw e;
   }
+}
+
+function webhookPixEfiUrlComIgnorar(webhookUrl) {
+  const url = String(webhookUrl || '').trim();
+  if (!url) throw new Error('URL do webhook Pix Efi ausente');
+  if (/[?&]ignorar=/.test(url)) return url;
+  return url.includes('?') ? `${url}&ignorar=` : `${url}?ignorar=`;
 }
 
 async function criarNotificacao(db, userId, titulo, mensagem, tipo, pedidoId) {
@@ -141,6 +148,34 @@ app.post('/configurarWebhookPixEfi', async (req, res) => {
     console.error('configurarWebhookPixEfi erro', e?.response?.data || e.message);
     res.status(500).json({
       erro: 'Erro ao configurar webhook Pix Efí',
+      detalhes: e?.response?.data || e.message,
+    });
+  }
+});
+
+app.post('/cadastrarWebhookPixEfi', async (req, res) => {
+  try {
+    required('EFI_CHAVE_PIX_APP', EFI_CHAVE_PIX_APP);
+    const webhookUrl = webhookPixEfiUrlComIgnorar(
+      req.body?.webhookUrl || 'https://faz-pramim-render.onrender.com/webhookPixEfi'
+    );
+    const resposta = await efiRequest(
+      'PUT',
+      `/v2/webhook/${encodeURIComponent(EFI_CHAVE_PIX_APP)}`,
+      { webhookUrl },
+      { 'x-skip-mtls-checking': 'true' }
+    );
+
+    res.json({
+      sucesso: true,
+      chave: EFI_CHAVE_PIX_APP,
+      webhookUrl,
+      resposta,
+    });
+  } catch (e) {
+    console.error('cadastrarWebhookPixEfi erro', e?.response?.data || e.message);
+    res.status(500).json({
+      erro: 'Erro ao cadastrar webhook Pix Efi',
       detalhes: e?.response?.data || e.message,
     });
   }

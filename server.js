@@ -121,6 +121,31 @@ async function criarNotificacao(db, userId, titulo, mensagem, tipo, pedidoId) {
 app.get('/', (req, res) => res.json({ ok: true, app: 'Faz Pra Mim Efí Render Backend' }));
 app.get('/health', (req, res) => res.json({ ok: true, at: new Date().toISOString() }));
 
+app.post('/configurarWebhookPixEfi', async (req, res) => {
+  try {
+    required('EFI_CHAVE_PIX_APP', EFI_CHAVE_PIX_APP);
+    const webhookUrl = 'https://faz-pramim-render.onrender.com/webhookPixEfi';
+    const resposta = await efiRequest(
+      'PUT',
+      `/v2/webhook/${encodeURIComponent(EFI_CHAVE_PIX_APP)}`,
+      { webhookUrl }
+    );
+
+    res.json({
+      sucesso: true,
+      chave: EFI_CHAVE_PIX_APP,
+      webhookUrl,
+      resposta,
+    });
+  } catch (e) {
+    console.error('configurarWebhookPixEfi erro', e?.response?.data || e.message);
+    res.status(500).json({
+      erro: 'Erro ao configurar webhook Pix Efí',
+      detalhes: e?.response?.data || e.message,
+    });
+  }
+});
+
 app.post('/criarPagamentoPix', async (req, res) => {
   try {
     initFirebase();

@@ -154,7 +154,19 @@ function repassePixEfiConfirmado(envio) {
     .trim()
     .toUpperCase();
 
-  return ["CONCLUIDA", "CONCLUIDO", "EFETIVADO", "REALIZADO"].includes(status);
+  return [
+    "CONCLUIDA",
+    "CONCLUIDO",
+    "EFETIVADA",
+    "EFETIVADO",
+    "LIQUIDADA",
+    "LIQUIDADO",
+    "REALIZADA",
+    "REALIZADO",
+    "SUCESSO",
+    "EXECUTADA",
+    "EXECUTADO",
+  ].includes(status);
 }
 
 async function consultarRepassePixEfi(idEnvio) {
@@ -166,6 +178,201 @@ async function consultarRepassePixEfi(idEnvio) {
       erro: erroPublicoEfi(e),
     });
     return null;
+  }
+}
+
+function comprovanteRepassePixEfi({
+  idEnvio,
+  envio,
+  consultaRepasse,
+  valorPrestador,
+}) {
+  const origem = consultaRepasse || envio || {};
+
+  return {
+    idEnvio,
+    endToEndId: origem.endToEndId || origem.e2eId || "",
+    horario: origem.horario || origem.criadoEm || origem.data || "",
+    valor: somenteDinheiro(valorPrestador),
+    favorecido: origem.favorecido || envio?.favorecido || null,
+    dadosEfi: envio || null,
+    consultaEfi: consultaRepasse || null,
+  };
+}
+
+async function marcarRepassePixEfiConcluido({
+  pedidoRef,
+  pedidoId,
+  prestadorId,
+  idEnvio,
+  envio,
+  consultaRepasse,
+  valorPrestador,
+  valorTotal,
+  comissaoApp,
+  chavePixTrabalhador,
+  notificar = true,
+}) {
+  const comprovante = comprovanteRepassePixEfi({
+    idEnvio,
+    envio,
+    consultaRepasse,
+    valorPrestador,
+  });
+
+  await pedidoRef.set(
+    {
+      pagamentoStatus: "repasse_concluido",
+      repassePrestadorStatus: "concluido",
+      repassePrestadorMensagem:
+        "Servico confirmado. Repasse enviado com sucesso ao trabalhador.",
+      repassePrestadorDadosEfi: envio || null,
+      repassePrestadorConsultaEfi: consultaRepasse || null,
+      repassePrestadorComprovante: comprovante,
+      repassePrestadorEm: agora(),
+      dinheiroRetidoAteConfirmacao: false,
+      atualizadoEm: agora(),
+    },
+    { merge: true }
+  );
+
+  await db.collection("repasses").doc(idEnvio).set(
+    {
+      pedidoId,
+      prestadorId,
+      chavePixTrabalhador,
+      valorTotal,
+      comissaoApp,
+      valorPrestador,
+      provedor: "efi",
+      idEnvio,
+      status: "concluido",
+      dadosEfi: envio || null,
+      consultaEfi: consultaRepasse || null,
+      comprovante,
+      concluidoEm: agora(),
+      atualizadoEm: agora(),
+    },
+    { merge: true }
+  );
+
+  if (notificar && prestadorId) {
+    await criarNotificacao(
+      prestadorId,
+      "Repasse enviado",
+      `Seu repasse de R$ ${Number(valorPrestador)
+        .toFixed(2)
+        .replace(".", ",")} foi enviado via Pix.`,
+      "repasse_enviado",
+      pedidoId
+    );
+  }
+
+  return comprovante;
+}
+
+async function reconciliarRepassePixEfiPendente(pedidoId, dadosPedido = null) {
+  const pedidoRef = db.collection("pedidos").doc(String(pedidoId));
+  const pedidoSnap = dadosPedido ? null : await pedidoRef.get();
+  const pedido = dadosPedido || (pedidoSnap.exists ? pedidoSnap.data() || {} : {});
+  const idEnvio = String(pedido.repassePrestadorIdEnvio || "").trim();
+
+  if (!idEnvio || pedido.repassePrestadorStatus !== "processando") {
+    return { concluido: false, idEnvio };
+  }
+
+  const repasseSnap = await db.collection("repasses").doc(idEnvio).get();
+  const repasse = repasseSnap.exists ? repasseSnap.data() || {} : {};
+  const consultaRepasse = await consultarRepassePixEfi(idEnvio);
+
+  if (!repassePixEfiConfirmado(consultaRepasse)) {
+    await db.collection("repasses").doc(idEnvio).set(
+      {
+        pedidoId: String(pedidoId),
+        provedor: "efi",
+        idEnvio,
+        status: "processando",
+        consultaEfi: consultaRepasse || null,
+        ultimaConsultaEm: agora(),
+        atualizadoEm: agora(),
+      },
+      { merge: true }
+    );
+
+    return { concluido: false, idEnvio, consultaRepasse };
+  }
+
+  const prestadorId = String(
+    repasse.prestadorId || pedido.prestadorId || pedido.aceitoPor || ""
+  );
+  const valorTotal = Number(
+    repasse.valorTotal || pedido.valorTotal || valorDoPedido(pedido)
+  );
+  const comissaoApp = Number(
+    repasse.comissaoApp || pedido.comissaoApp || (valorTotal * 0.1).toFixed(2)
+  );
+  const valorPrestador = Number(
+    repasse.valorPrestador ||
+      pedido.valorPrestador ||
+      (valorTotal - comissaoApp).toFixed(2)
+  );
+
+  const comprovante = await marcarRepassePixEfiConcluido({
+    pedidoRef,
+    pedidoId: String(pedidoId),
+    prestadorId,
+    idEnvio,
+    envio: repasse.dadosEfi || pedido.repassePrestadorDadosEfi || null,
+    consultaRepasse,
+    valorPrestador,
+    valorTotal,
+    comissaoApp,
+    chavePixTrabalhador:
+      repasse.chavePixTrabalhador || pedido.prestadorPix || "",
+  });
+
+  return { concluido: true, idEnvio, consultaRepasse, comprovante };
+}
+
+let reconciliandoRepassesEfi = false;
+
+async function processarRepassesPixEfiPendentes(limite = 20) {
+  if (reconciliandoRepassesEfi) {
+    return { processados: 0, concluidos: 0, ignorado: true };
+  }
+
+  reconciliandoRepassesEfi = true;
+
+  try {
+    const snap = await db
+      .collection("repasses")
+      .where("status", "==", "processando")
+      .limit(limite)
+      .get();
+
+    let concluidos = 0;
+
+    for (const doc of snap.docs) {
+      const repasse = doc.data() || {};
+      if (repasse.provedor && repasse.provedor !== "efi") continue;
+      const pedidoId = String(repasse.pedidoId || "").trim();
+      if (!pedidoId) continue;
+
+      try {
+        const resultado = await reconciliarRepassePixEfiPendente(pedidoId);
+        if (resultado.concluido) concluidos += 1;
+      } catch (e) {
+        console.error("Erro ao reconciliar repasse Pix Efi pendente:", {
+          pedidoId,
+          idEnvio: doc.id,
+          erro: erroPublicoEfi(e),
+        });
+      }
+    }
+
+    return { processados: snap.size, concluidos };
+  } finally {
+    reconciliandoRepassesEfi = false;
   }
 }
 
@@ -781,6 +988,31 @@ app.post("/verificarPagamentoManual", async (req, res) => {
   }
 });
 
+app.all("/processarRepassesPendentes", async (req, res) => {
+  try {
+    const segredoConfigurado = String(process.env.CRON_SECRET || "").trim();
+    const segredoRecebido = String(
+      req.headers["x-cron-secret"] || req.query?.secret || req.body?.secret || ""
+    ).trim();
+
+    if (segredoConfigurado && segredoRecebido !== segredoConfigurado) {
+      return res.status(401).json({ erro: "Nao autorizado" });
+    }
+
+    const limite = Math.min(Number(req.body?.limite || req.query?.limite || 20), 50);
+    const resultado = await processarRepassesPixEfiPendentes(limite);
+
+    return res.status(200).json({ sucesso: true, ...resultado });
+  } catch (e) {
+    console.error("Erro ao processar repasses Pix Efi pendentes:", e);
+    return res.status(500).json({
+      sucesso: false,
+      erro: "Erro ao processar repasses pendentes",
+      detalhes: erroPublicoEfi(e),
+    });
+  }
+});
+
 app.post("/clienteConfirmouServico", async (req, res) => {
   const { pedidoId, clienteId } = req.body || {};
   const pedidoIdSeguro = normalizarId(pedidoId);
@@ -822,8 +1054,35 @@ app.post("/clienteConfirmouServico", async (req, res) => {
     if (pedido.repassePrestadorStatus === "concluido") {
       return res.status(200).json({
         sucesso: true,
-        mensagem: "Repasse ja concluido.",
+        mensagem:
+          "Repasse ja concluido. O pagamento ao trabalhador foi confirmado.",
         idEnvio: pedido.repassePrestadorIdEnvio || "",
+      });
+    }
+
+    if (pedido.repassePrestadorStatus === "processando") {
+      idEnvio = String(pedido.repassePrestadorIdEnvio || "");
+      const resultado = await reconciliarRepassePixEfiPendente(
+        pedidoIdSeguro,
+        pedido
+      );
+
+      if (resultado.concluido) {
+        return res.status(200).json({
+          sucesso: true,
+          mensagem:
+            "Servico confirmado. Repasse enviado com sucesso ao trabalhador.",
+          idEnvio: resultado.idEnvio,
+          comprovante: resultado.comprovante,
+        });
+      }
+
+      return res.status(202).json({
+        sucesso: true,
+        status: "processando",
+        mensagem:
+          "Repasse Pix ja foi solicitado na Efi e sera confirmado automaticamente.",
+        idEnvio: resultado.idEnvio || idEnvio,
       });
     }
 
@@ -1034,56 +1293,22 @@ app.post("/clienteConfirmouServico", async (req, res) => {
       });
     }
 
-    const comprovante = {
-      idEnvio,
-      endToEndId: envio.endToEndId || envio.e2eId || "",
-      horario: envio.horario || envio.criadoEm || "",
-      valor: somenteDinheiro(valorPrestador),
-      favorecido: envio.favorecido || null,
-      dadosEfi: envio,
-      consultaEfi: consultaRepasse,
-    };
-
-    await pedidoRef.set(
-      {
-        pagamentoStatus: "repasse_concluido",
-        repassePrestadorStatus: "concluido",
-        repassePrestadorMensagem:
-          "Repasse Pix confirmado pela consulta da Efi.",
-        repassePrestadorDadosEfi: envio,
-        repassePrestadorConsultaEfi: consultaRepasse,
-        repassePrestadorComprovante: comprovante,
-        repassePrestadorEm: agora(),
-        atualizadoEm: agora(),
-      },
-      { merge: true }
-    );
-
-    await db.collection("repasses").doc(idEnvio).set(
-      {
-        status: "concluido",
-        dadosEfi: envio,
-        consultaEfi: consultaRepasse,
-        comprovante,
-        concluidoEm: agora(),
-        atualizadoEm: agora(),
-      },
-      { merge: true }
-    );
-
-    await criarNotificacao(
+    const comprovante = await marcarRepassePixEfiConcluido({
+      pedidoRef,
+      pedidoId: pedidoIdSeguro,
       prestadorId,
-      "Repasse enviado",
-      `Seu repasse de R$ ${valorPrestador
-        .toFixed(2)
-        .replace(".", ",")} foi enviado via Pix.`,
-      "repasse_enviado",
-      pedidoIdSeguro
-    );
+      idEnvio,
+      envio,
+      consultaRepasse,
+      valorPrestador,
+      valorTotal,
+      comissaoApp,
+      chavePixTrabalhador,
+    });
 
     return res.status(200).json({
       sucesso: true,
-      mensagem: "Servico confirmado. Repasse Pix confirmado pela Efi.",
+      mensagem: "Servico confirmado. Repasse enviado com sucesso ao trabalhador.",
       valorTotal,
       comissaoApp,
       valorPrestador,
@@ -1096,15 +1321,31 @@ app.post("/clienteConfirmouServico", async (req, res) => {
     if (String(e.message).includes("REPASSE_JA_CONCLUIDO")) {
       return res.status(200).json({
         sucesso: true,
-        mensagem: "Repasse ja concluido.",
+        mensagem:
+          "Repasse ja concluido. O pagamento ao trabalhador foi confirmado.",
         idEnvio,
       });
     }
 
     if (String(e.message).includes("REPASSE_EM_PROCESSAMENTO")) {
-      return res.status(409).json({
-        erro: "Repasse ja esta em processamento. Aguarde.",
-        idEnvio,
+      const resultado = await reconciliarRepassePixEfiPendente(pedidoIdSeguro);
+
+      if (resultado.concluido) {
+        return res.status(200).json({
+          sucesso: true,
+          mensagem:
+            "Servico confirmado. Repasse enviado com sucesso ao trabalhador.",
+          idEnvio: resultado.idEnvio,
+          comprovante: resultado.comprovante,
+        });
+      }
+
+      return res.status(202).json({
+        sucesso: true,
+        status: "processando",
+        mensagem:
+          "Repasse ja esta em processamento e sera confirmado automaticamente.",
+        idEnvio: resultado.idEnvio || idEnvio,
       });
     }
 
@@ -1159,6 +1400,25 @@ app.post("/clienteConfirmouServico", async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
+
+if (process.env.ENABLE_REPASSE_EFI_WORKER !== "false") {
+  const intervaloMs = Math.max(
+    Number(process.env.REPASSE_EFI_WORKER_INTERVAL_MS || 60000),
+    15000
+  );
+
+  setTimeout(() => {
+    processarRepassesPixEfiPendentes().catch((e) => {
+      console.error("Worker inicial de repasse Pix Efi falhou:", erroPublicoEfi(e));
+    });
+  }, 5000);
+
+  setInterval(() => {
+    processarRepassesPixEfiPendentes().catch((e) => {
+      console.error("Worker de repasse Pix Efi falhou:", erroPublicoEfi(e));
+    });
+  }, intervaloMs);
+}
 
 if (require.main === module) {
   app.listen(port, () => {

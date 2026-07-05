@@ -148,21 +148,25 @@ function somenteDinheiro(valor) {
 }
 
 function repassePixEfiConfirmado(envio) {
-  const endToEndId = String(
-    envio?.endToEndId || envio?.e2eId || envio?.endToEndID || ""
-  ).trim();
   const status = String(
     envio?.status || envio?.situacao || envio?.estado || ""
   )
     .trim()
     .toUpperCase();
 
-  return (
-    Boolean(endToEndId) ||
-    ["CONCLUIDA", "CONCLUIDO", "EFETIVADO", "REALIZADO", "ENVIADO"].includes(
-      status
-    )
-  );
+  return ["CONCLUIDA", "CONCLUIDO", "EFETIVADO", "REALIZADO"].includes(status);
+}
+
+async function consultarRepassePixEfi(idEnvio) {
+  try {
+    return await efiRequest("GET", `/v2/gn/pix/${idEnvio}`);
+  } catch (e) {
+    console.error("Erro ao consultar repasse Pix Efi:", {
+      idEnvio,
+      erro: erroPublicoEfi(e),
+    });
+    return null;
+  }
 }
 
 function detalhesErroEfi(erro) {
@@ -965,16 +969,34 @@ app.post("/clienteConfirmouServico", async (req, res) => {
       pedidoId: pedidoIdSeguro,
       idEnvio,
       endToEndId: envio.endToEndId || envio.e2eId || "",
+      status: envio.status || envio.situacao || envio.estado || "",
     });
 
-    if (!repassePixEfiConfirmado(envio)) {
+    const consultaRepasse = await consultarRepassePixEfi(idEnvio);
+    const confirmacaoRepasse = consultaRepasse || envio;
+
+    console.log("Consulta do repasse Pix Efi recebida.", {
+      pedidoId: pedidoIdSeguro,
+      idEnvio,
+      endToEndId:
+        confirmacaoRepasse.endToEndId || confirmacaoRepasse.e2eId || "",
+      status:
+        confirmacaoRepasse.status ||
+        confirmacaoRepasse.situacao ||
+        confirmacaoRepasse.estado ||
+        "",
+      valor: confirmacaoRepasse.valor || "",
+    });
+
+    if (!repassePixEfiConfirmado(confirmacaoRepasse)) {
       const mensagemProcessando =
-        "Servico confirmado. Repasse Pix enviado para processamento pela Efi, mas ainda nao confirmado.";
+        "Servico confirmado. Repasse Pix solicitado na Efi, mas ainda nao confirmado no extrato.";
 
       console.warn("Repasse Pix Efi ainda nao confirmado.", {
         pedidoId: pedidoIdSeguro,
         idEnvio,
         envio,
+        consultaRepasse,
       });
 
       await pedidoRef.set(
@@ -983,6 +1005,7 @@ app.post("/clienteConfirmouServico", async (req, res) => {
           repassePrestadorStatus: "processando",
           repassePrestadorMensagem: mensagemProcessando,
           repassePrestadorDadosEfi: envio,
+          repassePrestadorConsultaEfi: consultaRepasse,
           dinheiroRetidoAteConfirmacao: true,
           atualizadoEm: agora(),
         },
@@ -993,6 +1016,7 @@ app.post("/clienteConfirmouServico", async (req, res) => {
         {
           status: "processando",
           dadosEfi: envio,
+          consultaEfi: consultaRepasse,
           mensagem: mensagemProcessando,
           atualizadoEm: agora(),
         },
@@ -1017,14 +1041,17 @@ app.post("/clienteConfirmouServico", async (req, res) => {
       valor: somenteDinheiro(valorPrestador),
       favorecido: envio.favorecido || null,
       dadosEfi: envio,
+      consultaEfi: consultaRepasse,
     };
 
     await pedidoRef.set(
       {
         pagamentoStatus: "repasse_concluido",
         repassePrestadorStatus: "concluido",
-        repassePrestadorMensagem: "Repasse automatico Pix enviado pela Efí.",
+        repassePrestadorMensagem:
+          "Repasse Pix confirmado pela consulta da Efi.",
         repassePrestadorDadosEfi: envio,
+        repassePrestadorConsultaEfi: consultaRepasse,
         repassePrestadorComprovante: comprovante,
         repassePrestadorEm: agora(),
         atualizadoEm: agora(),
@@ -1036,6 +1063,7 @@ app.post("/clienteConfirmouServico", async (req, res) => {
       {
         status: "concluido",
         dadosEfi: envio,
+        consultaEfi: consultaRepasse,
         comprovante,
         concluidoEm: agora(),
         atualizadoEm: agora(),
@@ -1055,7 +1083,7 @@ app.post("/clienteConfirmouServico", async (req, res) => {
 
     return res.status(200).json({
       sucesso: true,
-      mensagem: "Servico confirmado. Repasse Pix enviado automaticamente.",
+      mensagem: "Servico confirmado. Repasse Pix confirmado pela Efi.",
       valorTotal,
       comissaoApp,
       valorPrestador,

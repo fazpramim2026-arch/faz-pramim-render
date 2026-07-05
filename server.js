@@ -172,6 +172,20 @@ function erroPublicoEfi(erro) {
   };
 }
 
+function pedidoTemPagamentoConfirmadoParaRepasse(pedido) {
+  if (pedido.pago !== true) return false;
+
+  const status = String(pedido.pagamentoStatus || "").trim();
+  const statusPermitidos = new Set([
+    "pago_bloqueado",
+    "aguardando_confirmacao_cliente",
+    "repasse_erro",
+    "liberado_para_repasse",
+  ]);
+
+  return statusPermitidos.has(status) || Boolean(pedido.pagamentoConfirmadoEm);
+}
+
 function getEfiConfig() {
   return {
     baseUrl: process.env.EFI_BASE_URL || "https://pix.api.efipay.com.br",
@@ -771,9 +785,9 @@ app.post("/clienteConfirmouServico", async (req, res) => {
       return res.status(403).json({ erro: "Cliente incorreto" });
     }
 
-    if (pedido.pago !== true || pedido.pagamentoStatus !== "pago_bloqueado") {
+    if (!pedidoTemPagamentoConfirmadoParaRepasse(pedido)) {
       return res.status(400).json({
-        erro: "Pedido ainda nao possui pagamento Pix confirmado e bloqueado.",
+        erro: "Pedido ainda nao possui pagamento Pix confirmado.",
       });
     }
 
@@ -870,7 +884,7 @@ app.post("/clienteConfirmouServico", async (req, res) => {
         throw new Error("REPASSE_EM_PROCESSAMENTO");
       }
 
-      if (dados.pago !== true || dados.pagamentoStatus !== "pago_bloqueado") {
+      if (!pedidoTemPagamentoConfirmadoParaRepasse(dados)) {
         throw new Error("PAGAMENTO_NAO_BLOQUEADO");
       }
 

@@ -147,6 +147,24 @@ function somenteDinheiro(valor) {
   return numero.toFixed(2);
 }
 
+function repassePixEfiConfirmado(envio) {
+  const endToEndId = String(
+    envio?.endToEndId || envio?.e2eId || envio?.endToEndID || ""
+  ).trim();
+  const status = String(
+    envio?.status || envio?.situacao || envio?.estado || ""
+  )
+    .trim()
+    .toUpperCase();
+
+  return (
+    Boolean(endToEndId) ||
+    ["CONCLUIDA", "CONCLUIDO", "EFETIVADO", "REALIZADO", "ENVIADO"].includes(
+      status
+    )
+  );
+}
+
 function detalhesErroEfi(erro) {
   if (erro?.response) {
     return {
@@ -835,7 +853,7 @@ app.post("/clienteConfirmouServico", async (req, res) => {
           repassePrestadorStatus: "erro_sem_pix",
           repassePrestadorMensagem: erroSemPix.message,
           repassePrestadorErro: erroSemPix,
-          dinheiroRetidoAteConfirmacao: false,
+          dinheiroRetidoAteConfirmacao: true,
           clienteConfirmouServico: true,
           clienteConfirmouFinalizacao: true,
           clienteConfirmouEm: agora(),
@@ -897,7 +915,7 @@ app.post("/clienteConfirmouServico", async (req, res) => {
         {
           status: "concluido",
           pagamentoStatus: "repasse_processando",
-          dinheiroRetidoAteConfirmacao: false,
+          dinheiroRetidoAteConfirmacao: true,
           clienteConfirmouServico: true,
           clienteConfirmouFinalizacao: true,
           clienteConfirmouEm: agora(),
@@ -943,11 +961,54 @@ app.post("/clienteConfirmouServico", async (req, res) => {
       favorecido: { chave: chavePixTrabalhador },
     });
 
-    console.log("Repasse Pix Efí concluido.", {
+    console.log("Resposta do repasse Pix Efi recebida.", {
       pedidoId: pedidoIdSeguro,
       idEnvio,
       endToEndId: envio.endToEndId || envio.e2eId || "",
     });
+
+    if (!repassePixEfiConfirmado(envio)) {
+      const mensagemProcessando =
+        "Servico confirmado. Repasse Pix enviado para processamento pela Efi, mas ainda nao confirmado.";
+
+      console.warn("Repasse Pix Efi ainda nao confirmado.", {
+        pedidoId: pedidoIdSeguro,
+        idEnvio,
+        envio,
+      });
+
+      await pedidoRef.set(
+        {
+          pagamentoStatus: "repasse_processando",
+          repassePrestadorStatus: "processando",
+          repassePrestadorMensagem: mensagemProcessando,
+          repassePrestadorDadosEfi: envio,
+          dinheiroRetidoAteConfirmacao: true,
+          atualizadoEm: agora(),
+        },
+        { merge: true }
+      );
+
+      await db.collection("repasses").doc(idEnvio).set(
+        {
+          status: "processando",
+          dadosEfi: envio,
+          mensagem: mensagemProcessando,
+          atualizadoEm: agora(),
+        },
+        { merge: true }
+      );
+
+      return res.status(202).json({
+        sucesso: true,
+        status: "processando",
+        mensagem: mensagemProcessando,
+        valorTotal,
+        comissaoApp,
+        valorPrestador,
+        idEnvio,
+      });
+    }
 
     const comprovante = {
       idEnvio,
@@ -1040,6 +1101,7 @@ app.post("/clienteConfirmouServico", async (req, res) => {
           repassePrestadorMensagem: erroPersistido.mensagem,
           repassePrestadorErro: erroPersistido,
           pagamentoStatus: "repasse_erro",
+          dinheiroRetidoAteConfirmacao: true,
           atualizadoEm: agora(),
         },
         { merge: true }

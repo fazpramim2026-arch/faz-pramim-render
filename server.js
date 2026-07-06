@@ -93,6 +93,61 @@ async function carregarPedidoAutorizado(pedidoId, decoded, papelEsperado) {
   return { pedidoRef, pedido };
 }
 
+function trabalhadorEscolhidoDoPedido(pedido) {
+  return String(pedido?.prestadorId || pedido?.aceitoPor || "").trim();
+}
+
+function chavePixDoCadastroTrabalhador(trabalhador) {
+  const campos = [
+    ["pix", trabalhador?.pix],
+    ["chavePix", trabalhador?.chavePix],
+    ["chave_pix", trabalhador?.chave_pix],
+  ];
+
+  for (const [campo, valor] of campos) {
+    const chavePix = String(valor || "").trim();
+    if (chavePix) {
+      return {
+        chavePix,
+        origemChavePix: `usuarios.${campo}`,
+      };
+    }
+  }
+
+  return {
+    chavePix: "",
+    origemChavePix: "nao_encontrada_no_cadastro_do_trabalhador",
+  };
+}
+
+async function carregarTrabalhadorEscolhidoDoPedido(pedido) {
+  const trabalhadorId = trabalhadorEscolhidoDoPedido(pedido);
+
+  if (!trabalhadorId) {
+    const erro = new Error("Pedido sem trabalhador vinculado.");
+    erro.status = 400;
+    throw erro;
+  }
+
+  const trabalhadorDoc = await db
+    .collection("usuarios")
+    .doc(trabalhadorId)
+    .get();
+  const trabalhador =
+    trabalhadorDoc && trabalhadorDoc.exists ? trabalhadorDoc.data() || {} : {};
+  const { chavePix, origemChavePix } =
+    chavePixDoCadastroTrabalhador(trabalhador);
+
+  return {
+    trabalhadorId,
+    trabalhador,
+    nomeTrabalhador:
+      trabalhador.nome || trabalhador.nomeCompleto || trabalhador.apelido || "",
+    chavePixTrabalhador: chavePix,
+    origemChavePix,
+  };
+}
+
 function valorDoPedido(pedido) {
   const candidatos = [
     pedido.valorServico,
@@ -453,16 +508,12 @@ async function reconciliarRepassePixEfiPendente(pedidoId, dadosPedido = null) {
     return { concluido: false, idEnvio, consultaRepasse };
   }
 
-  const prestadorId = String(
-    repasse.prestadorId || pedido.prestadorId || pedido.aceitoPor || ""
-  );
-  const prestadorDoc = prestadorId
-    ? await db.collection("usuarios").doc(prestadorId).get()
-    : null;
-  const prestador = prestadorDoc?.exists ? prestadorDoc.data() || {} : {};
-  const chavePixTrabalhador = String(
-    prestador.pix || prestador.chavePix || prestador.chave_pix || ""
-  ).trim();
+  const {
+    trabalhadorId: prestadorId,
+    nomeTrabalhador,
+    chavePixTrabalhador,
+    origemChavePix,
+  } = await carregarTrabalhadorEscolhidoDoPedido(pedido);
   const valorPago = valorPagoDoPedido(pedido);
   const valorOrcamento = valorOrcamentoDoPedido(pedido);
   const valorBaseRepasse = valorPago || valorOrcamento || valorDoPedido(pedido);
@@ -477,16 +528,15 @@ async function reconciliarRepassePixEfiPendente(pedidoId, dadosPedido = null) {
     pedidoId: String(pedidoId),
     idEnvio,
     trabalhadorId: prestadorId,
-    nomeTrabalhador: prestador.nome || prestador.nomeCompleto || "",
+    nomeTrabalhador,
     chavePixTrabalhador,
-    origemChavePix: chavePixTrabalhador
-      ? "usuarios.pix/chavePix/chave_pix"
-      : "nao_encontrada_no_cadastro_do_trabalhador",
+    origemChavePix,
     valorPago,
     valorOrcamento,
     valorTotal,
     valorTrabalhador,
     comissaoApp,
+    valorEnviadoParaTrabalhador: valorPrestador,
     valorEnviadoParaEfi: somenteDinheiro(valorPrestador),
     valoresSalvosRepasse: {
       valorTotal: repasse.valorTotal || null,
@@ -1290,26 +1340,12 @@ app.post("/clienteConfirmouServico", async (req, res) => {
       });
     }
 
-    const prestadorId = pedido.prestadorId || pedido.aceitoPor || "";
-    const prestadorDoc = prestadorId
-      ? await db.collection("usuarios").doc(String(prestadorId)).get()
-      : null;
-    const prestador =
-      prestadorDoc && prestadorDoc.exists ? prestadorDoc.data() || {} : {};
-    const origemChavePix = prestador.pix
-      ? "usuarios.pix"
-      : prestador.chavePix
-        ? "usuarios.chavePix"
-        : prestador.chave_pix
-          ? "usuarios.chave_pix"
-          : "nao_encontrada_no_cadastro_do_trabalhador";
-    const chavePixTrabalhador = String(
-      prestador.pix || prestador.chavePix || prestador.chave_pix || ""
-    ).trim();
-
-    if (!prestadorId) {
-      return res.status(400).json({ erro: "Pedido sem trabalhador vinculado." });
-    }
+    const {
+      trabalhadorId: prestadorId,
+      nomeTrabalhador,
+      chavePixTrabalhador,
+      origemChavePix,
+    } = await carregarTrabalhadorEscolhidoDoPedido(pedido);
 
     if (!chavePixTrabalhador) {
       const erroSemPix = {
@@ -1366,8 +1402,7 @@ app.post("/clienteConfirmouServico", async (req, res) => {
       idEnvio,
       pagamentoId: pagamentoIdSeguro,
       trabalhadorIdEscolhido: prestadorId,
-      nomeTrabalhador:
-        prestador.nome || prestador.nomeCompleto || prestador.apelido || "",
+      nomeTrabalhador,
       chavePixTrabalhador,
       origemChavePix,
       valorPago,
@@ -1376,6 +1411,7 @@ app.post("/clienteConfirmouServico", async (req, res) => {
       valorTrabalhador,
       comissaoApp,
       valorPrestador,
+      valorEnviadoParaTrabalhador: valorPrestador,
       valorEnviadoParaEfi: somenteDinheiro(valorPrestador),
       valoresSalvosNoPedido: {
         valorTotal: pedido.valorTotal || null,
@@ -1403,6 +1439,11 @@ app.post("/clienteConfirmouServico", async (req, res) => {
 
       if (dados.trabalhadorFinalizou !== true) {
         throw new Error("SERVICO_NAO_FINALIZADO_PELO_TRABALHADOR");
+      }
+
+      const trabalhadorIdAtual = trabalhadorEscolhidoDoPedido(dados);
+      if (trabalhadorIdAtual !== prestadorId) {
+        throw new Error("TRABALHADOR_ESCOLHIDO_ALTERADO_NO_PEDIDO");
       }
 
       transaction.set(
@@ -1435,6 +1476,7 @@ app.post("/clienteConfirmouServico", async (req, res) => {
         clienteId: clienteIdSeguro,
         prestadorId,
         chavePixTrabalhador,
+        origemChavePix,
         pagamentoId: pagamentoIdSeguro,
         valorPago,
         valorOrcamento,
@@ -1442,6 +1484,7 @@ app.post("/clienteConfirmouServico", async (req, res) => {
         comissaoApp,
         valorPrestador,
         valorTrabalhador,
+        valorEnviadoParaTrabalhador: valorPrestador,
         provedor: "efi",
         idEnvio,
         idEnvioEfi: idEnvio,
@@ -1457,8 +1500,7 @@ app.post("/clienteConfirmouServico", async (req, res) => {
     console.log("Enviando repasse Pix Efi.", {
       pedidoId: pedidoIdSeguro,
       trabalhadorIdEscolhido: prestadorId,
-      nomeTrabalhador:
-        prestador.nome || prestador.nomeCompleto || prestador.apelido || "",
+      nomeTrabalhador,
       chavePixTrabalhador,
       origemChavePix,
       valorPago,
@@ -1466,6 +1508,7 @@ app.post("/clienteConfirmouServico", async (req, res) => {
       valorTotal,
       valorTrabalhador,
       comissaoApp,
+      valorEnviadoParaTrabalhador: valorPrestador,
       valorEnviadoParaEfi,
       endpoint: `/v3/gn/pix/${idEnvio}`,
     });

@@ -456,6 +456,13 @@ async function reconciliarRepassePixEfiPendente(pedidoId, dadosPedido = null) {
   const prestadorId = String(
     repasse.prestadorId || pedido.prestadorId || pedido.aceitoPor || ""
   );
+  const prestadorDoc = prestadorId
+    ? await db.collection("usuarios").doc(prestadorId).get()
+    : null;
+  const prestador = prestadorDoc?.exists ? prestadorDoc.data() || {} : {};
+  const chavePixTrabalhador = String(
+    prestador.pix || prestador.chavePix || prestador.chave_pix || ""
+  ).trim();
   const valorPago = valorPagoDoPedido(pedido);
   const valorOrcamento = valorOrcamentoDoPedido(pedido);
   const valorBaseRepasse = valorPago || valorOrcamento || valorDoPedido(pedido);
@@ -469,6 +476,12 @@ async function reconciliarRepassePixEfiPendente(pedidoId, dadosPedido = null) {
   console.log("Reconciliando repasse Pix Efi; valores recalculados.", {
     pedidoId: String(pedidoId),
     idEnvio,
+    trabalhadorId: prestadorId,
+    nomeTrabalhador: prestador.nome || prestador.nomeCompleto || "",
+    chavePixTrabalhador,
+    origemChavePix: chavePixTrabalhador
+      ? "usuarios.pix/chavePix/chave_pix"
+      : "nao_encontrada_no_cadastro_do_trabalhador",
     valorPago,
     valorOrcamento,
     valorTotal,
@@ -492,8 +505,7 @@ async function reconciliarRepassePixEfiPendente(pedidoId, dadosPedido = null) {
     valorPrestador,
     valorTotal,
     comissaoApp,
-    chavePixTrabalhador:
-      repasse.chavePixTrabalhador || pedido.prestadorPix || "",
+    chavePixTrabalhador,
   });
 
   return { concluido: true, idEnvio, consultaRepasse, comprovante };
@@ -1284,12 +1296,15 @@ app.post("/clienteConfirmouServico", async (req, res) => {
       : null;
     const prestador =
       prestadorDoc && prestadorDoc.exists ? prestadorDoc.data() || {} : {};
+    const origemChavePix = prestador.pix
+      ? "usuarios.pix"
+      : prestador.chavePix
+        ? "usuarios.chavePix"
+        : prestador.chave_pix
+          ? "usuarios.chave_pix"
+          : "nao_encontrada_no_cadastro_do_trabalhador";
     const chavePixTrabalhador = String(
-      pedido.prestadorPix ||
-        prestador.pix ||
-        prestador.chavePix ||
-        prestador.chave_pix ||
-        ""
+      prestador.pix || prestador.chavePix || prestador.chave_pix || ""
     ).trim();
 
     if (!prestadorId) {
@@ -1350,6 +1365,11 @@ app.post("/clienteConfirmouServico", async (req, res) => {
       prestadorId,
       idEnvio,
       pagamentoId: pagamentoIdSeguro,
+      trabalhadorIdEscolhido: prestadorId,
+      nomeTrabalhador:
+        prestador.nome || prestador.nomeCompleto || prestador.apelido || "",
+      chavePixTrabalhador,
+      origemChavePix,
       valorPago,
       valorOrcamento,
       valorTotal,
@@ -1436,6 +1456,11 @@ app.post("/clienteConfirmouServico", async (req, res) => {
 
     console.log("Enviando repasse Pix Efi.", {
       pedidoId: pedidoIdSeguro,
+      trabalhadorIdEscolhido: prestadorId,
+      nomeTrabalhador:
+        prestador.nome || prestador.nomeCompleto || prestador.apelido || "",
+      chavePixTrabalhador,
+      origemChavePix,
       valorPago,
       valorOrcamento,
       valorTotal,

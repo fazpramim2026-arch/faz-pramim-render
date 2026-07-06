@@ -94,14 +94,24 @@ async function carregarPedidoAutorizado(pedidoId, decoded, papelEsperado) {
 }
 
 function trabalhadorEscolhidoDoPedido(pedido) {
-  return String(pedido?.prestadorId || pedido?.aceitoPor || "").trim();
+  return String(
+    pedido?.trabalhadorId ||
+      pedido?.prestadorId ||
+      pedido?.profissionalId ||
+      pedido?.trabalhadorEscolhidoId ||
+      pedido?.prestadorEscolhidoId ||
+      pedido?.aceitoPor ||
+      ""
+  ).trim();
 }
 
 function chavePixDoCadastroTrabalhador(trabalhador) {
   const campos = [
-    ["pix", trabalhador?.pix],
     ["chavePix", trabalhador?.chavePix],
+    ["pix", trabalhador?.pix],
     ["chave_pix", trabalhador?.chave_pix],
+    ["pixKey", trabalhador?.pixKey],
+    ["chavePixTrabalhador", trabalhador?.chavePixTrabalhador],
   ];
 
   for (const [campo, valor] of campos) {
@@ -117,6 +127,34 @@ function chavePixDoCadastroTrabalhador(trabalhador) {
   return {
     chavePix: "",
     origemChavePix: "nao_encontrada_no_cadastro_do_trabalhador",
+  };
+}
+
+function normalizarChavePixParaEnvio(chavePix) {
+  const chaveSemEspacos = String(chavePix || "").trim().replace(/\s+/g, "");
+  const apenasDigitos = chaveSemEspacos.replace(/\D/g, "");
+  const temApenasPontuacaoDeDocumento =
+    /^[\d.\-]+$/.test(chaveSemEspacos) && /[.\-]/.test(chaveSemEspacos);
+
+  if (apenasDigitos.length === 11 && temApenasPontuacaoDeDocumento) {
+    return {
+      chavePixNormalizada: apenasDigitos,
+      formatoChavePixEnviada: "cpf_somente_numeros",
+    };
+  }
+
+  if (apenasDigitos.length === 11 && /^\d+$/.test(chaveSemEspacos)) {
+    return {
+      chavePixNormalizada: chaveSemEspacos,
+      formatoChavePixEnviada: "cpf_ou_telefone_11_digitos_mantido",
+    };
+  }
+
+  return {
+    chavePixNormalizada: chaveSemEspacos,
+    formatoChavePixEnviada: chaveSemEspacos.startsWith("+55")
+      ? "telefone_com_codigo_pais_mantido"
+      : "chave_mantida_sem_espacos",
   };
 }
 
@@ -169,9 +207,12 @@ function valorDoPedido(pedido) {
 }
 
 function calcularValores(valor) {
-  const valorTotal = Number(valor);
-  const comissaoApp = Number((valorTotal * 0.1).toFixed(2));
-  const valorPrestador = Number((valorTotal - comissaoApp).toFixed(2));
+  const valorTotalCentavos = Math.round(Number(valor) * 100);
+  const comissaoAppCentavos = Math.round(valorTotalCentavos * 0.1);
+  const valorPrestadorCentavos = valorTotalCentavos - comissaoAppCentavos;
+  const valorTotal = Number((valorTotalCentavos / 100).toFixed(2));
+  const comissaoApp = Number((comissaoAppCentavos / 100).toFixed(2));
+  const valorPrestador = Number((valorPrestadorCentavos / 100).toFixed(2));
 
   return { valorTotal, comissaoApp, valorPrestador };
 }
@@ -255,6 +296,35 @@ function repassePixEfiConfirmado(envio) {
     "EXECUTADA",
     "EXECUTADO",
   ].includes(status);
+}
+
+function statusRepassePixEfi(envio) {
+  return String(envio?.status || envio?.situacao || envio?.estado || "")
+    .trim()
+    .toUpperCase();
+}
+
+function repassePixEfiNaoRealizado(envio) {
+  return statusRepassePixEfi(envio) === "NAO_REALIZADO";
+}
+
+function detalhesRespostaRepassePixEfi(resposta) {
+  return {
+    status: statusRepassePixEfi(resposta),
+    idEnvio: resposta?.idEnvio || resposta?.idEnvioPix || "",
+    idEnvioPix: resposta?.idEnvioPix || "",
+    e2eId: resposta?.endToEndId || resposta?.e2eId || "",
+    motivo: resposta?.motivo || "",
+    erro: resposta?.erro || resposta?.error || "",
+    mensagem: resposta?.mensagem || resposta?.message || "",
+    detalhes:
+      resposta?.detalhes ||
+      resposta?.detail ||
+      resposta?.violacoes ||
+      resposta?.violations ||
+      null,
+    bodyCompletoEfi: resposta || null,
+  };
 }
 
 function e2eIdDoRepassePixEfi(...fontes) {
@@ -400,6 +470,10 @@ async function marcarRepassePixEfiConcluido({
       repassePrestadorEndToEndId: e2eIdDoRepassePixEfi(consultaRepasse, envio),
       repassePrestadorComprovante: comprovante,
       repassePrestadorEm: agora(),
+      repasseStatus: "REALIZADO",
+      repasseConcluido: true,
+      repasseValorTrabalhador: valorPrestador,
+      repasseAtualizadoEm: agora(),
       dinheiroRetidoAteConfirmacao: false,
       atualizadoEm: agora(),
     },
@@ -1348,6 +1422,10 @@ app.post("/clienteConfirmouServico", async (req, res) => {
     } = await carregarTrabalhadorEscolhidoDoPedido(pedido);
 
     if (!chavePixTrabalhador) {
+      console.error("Trabalhador escolhido sem chave Pix cadastrada.", {
+        pedidoId: pedidoIdSeguro,
+        trabalhadorId: prestadorId,
+      });
       const erroSemPix = {
         message: "Trabalhador sem chave Pix cadastrada.",
         code: "TRABALHADOR_SEM_PIX",
@@ -1378,8 +1456,9 @@ app.post("/clienteConfirmouServico", async (req, res) => {
       : null;
     const pagamento = pagamentoSnap?.exists ? pagamentoSnap.data() || {} : null;
     const valorPago = valorPagoDoPedido(pedido, pagamento);
+    const valorServico = valorPago;
     const valorOrcamento = valorOrcamentoDoPedido(pedido);
-    const valorBaseRepasse = valorPago || valorOrcamento || valorDoPedido(pedido);
+    const valorBaseRepasse = valorServico;
     const {
       valorTotal,
       comissaoApp,
@@ -1394,6 +1473,8 @@ app.post("/clienteConfirmouServico", async (req, res) => {
     const cfg = validarEfiConfig();
     exigirChavePixEfi(cfg);
     idEnvio = idEnvioDoPedido(pedidoIdSeguro);
+    const { chavePixNormalizada, formatoChavePixEnviada } =
+      normalizarChavePixParaEnvio(chavePixTrabalhador);
 
     console.log("Cliente confirmou servico; preparando repasse Pix Efí.", {
       pedidoId: pedidoIdSeguro,
@@ -1405,7 +1486,10 @@ app.post("/clienteConfirmouServico", async (req, res) => {
       nomeTrabalhador,
       chavePixTrabalhador,
       origemChavePix,
+      chavePixNormalizadaEnviada: chavePixNormalizada,
+      formatoChavePixEnviada,
       valorPago,
+      valorServico,
       valorOrcamento,
       valorTotal,
       valorTrabalhador,
@@ -1476,9 +1560,11 @@ app.post("/clienteConfirmouServico", async (req, res) => {
         clienteId: clienteIdSeguro,
         prestadorId,
         chavePixTrabalhador,
+        chavePixNormalizadaEnviada: chavePixNormalizada,
         origemChavePix,
         pagamentoId: pagamentoIdSeguro,
         valorPago,
+        valorServico,
         valorOrcamento,
         valorTotal,
         comissaoApp,
@@ -1503,7 +1589,10 @@ app.post("/clienteConfirmouServico", async (req, res) => {
       nomeTrabalhador,
       chavePixTrabalhador,
       origemChavePix,
+      chavePixNormalizadaEnviada: chavePixNormalizada,
+      formatoChavePixEnviada,
       valorPago,
+      valorServico,
       valorOrcamento,
       valorTotal,
       valorTrabalhador,
@@ -1522,16 +1611,14 @@ app.post("/clienteConfirmouServico", async (req, res) => {
           140
         ),
       },
-      favorecido: { chave: chavePixTrabalhador },
+      favorecido: { chave: chavePixNormalizada },
     });
 
-    console.log("Resposta do repasse Pix Efi recebida.", {
+    const detalhesEnvio = detalhesRespostaRepassePixEfi(envio);
+    console.log("Resposta completa do repasse Pix Efi recebida.", {
       pedidoId: pedidoIdSeguro,
       idEnvio,
-      idEnvioEfi: envio.idEnvio || "",
-      endToEndId: envio.endToEndId || envio.e2eId || "",
-      status: envio.status || envio.situacao || envio.estado || "",
-      resposta: envio,
+      ...detalhesEnvio,
     });
 
     const consultaRepasse = await consultarRepassePixEfi(idEnvio, envio);
@@ -1539,19 +1626,72 @@ app.post("/clienteConfirmouServico", async (req, res) => {
     const endToEndIdRepasse = e2eIdDoRepassePixEfi(consultaRepasse, envio);
     const idEnvioEfi = idEnvioDoRepassePixEfi(consultaRepasse, envio) || idEnvio;
 
-    console.log("Consulta do repasse Pix Efi recebida.", {
+    const detalhesConfirmacao = detalhesRespostaRepassePixEfi(confirmacaoRepasse);
+    console.log("Consulta completa do repasse Pix Efi recebida.", {
       pedidoId: pedidoIdSeguro,
       idEnvio,
       idEnvioEfi,
       endToEndId: endToEndIdRepasse,
-      status:
-        confirmacaoRepasse.status ||
-        confirmacaoRepasse.situacao ||
-        confirmacaoRepasse.estado ||
-        "",
       valor: confirmacaoRepasse.valor || "",
-      resposta: confirmacaoRepasse,
+      ...detalhesConfirmacao,
     });
+
+    if (repassePixEfiNaoRealizado(confirmacaoRepasse)) {
+      const erroDetalhado = detalhesRespostaRepassePixEfi(confirmacaoRepasse);
+
+      console.error("Repasse Pix Efi retornou NAO_REALIZADO.", {
+        pedidoId: pedidoIdSeguro,
+        trabalhadorId: prestadorId,
+        nomeTrabalhador,
+        chavePixTrabalhador,
+        origemChavePix,
+        chavePixNormalizadaEnviada: chavePixNormalizada,
+        formatoChavePixEnviada,
+        valorTotalPago: valorTotal,
+        valorServico,
+        comissaoApp,
+        valorEnviadoAoTrabalhador: valorPrestador,
+        respostaCompleta: erroDetalhado,
+      });
+
+      await pedidoRef.set(
+        {
+          pagamentoStatus: "repasse_erro",
+          repassePrestadorStatus: "nao_realizado",
+          repassePrestadorMensagem:
+            "Repasse Pix nao realizado pela Efi. Pedido disponivel para nova tentativa/manual.",
+          repassePrestadorDadosEfi: envio,
+          repassePrestadorConsultaEfi: consultaRepasse,
+          repasseStatus: "NAO_REALIZADO",
+          repasseConcluido: false,
+          repasseErroDetalhado: erroDetalhado,
+          repasseAtualizadoEm: agora(),
+          dinheiroRetidoAteConfirmacao: true,
+          atualizadoEm: agora(),
+        },
+        { merge: true }
+      );
+
+      await db.collection("repasses").doc(idEnvio).set(
+        {
+          status: "NAO_REALIZADO",
+          erroDetalhado,
+          dadosEfi: envio,
+          consultaEfi: consultaRepasse,
+          atualizadoEm: agora(),
+        },
+        { merge: true }
+      );
+
+      return res.status(422).json({
+        sucesso: false,
+        status: "NAO_REALIZADO",
+        erro:
+          "Repasse Pix nao realizado pela Efi. Verifique os detalhes para nova tentativa/manual.",
+        detalhes: erroDetalhado,
+        idEnvio,
+      });
+    }
 
     if (!repassePixEfiConfirmado(confirmacaoRepasse)) {
       const mensagemProcessando =

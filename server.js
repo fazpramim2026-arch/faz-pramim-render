@@ -95,8 +95,10 @@ async function carregarPedidoAutorizado(pedidoId, decoded, papelEsperado) {
 
 function valorDoPedido(pedido) {
   const candidatos = [
-    pedido.valorTotal,
     pedido.valorServico,
+    pedido.valorOrcamento,
+    pedido.valorPago,
+    pedido.valorTotal,
     pedido.valor,
     pedido.preco,
   ];
@@ -117,6 +119,37 @@ function calcularValores(valor) {
   const valorPrestador = Number((valorTotal - comissaoApp).toFixed(2));
 
   return { valorTotal, comissaoApp, valorPrestador };
+}
+
+function numeroPositivo(valor) {
+  const numero = Number(valor);
+  return Number.isFinite(numero) && numero > 0 ? numero : 0;
+}
+
+function valorPagoDoPagamento(pagamento) {
+  if (!pagamento || typeof pagamento !== "object") return 0;
+
+  return numeroPositivo(
+    pagamento.valorPago ||
+      pagamento.valorTotal ||
+      pagamento.valorServico ||
+      pagamento.cobrancaEfiConfirmada?.valor?.original ||
+      pagamento.cobrancaEfi?.valor?.original
+  );
+}
+
+function valorPagoDoPedido(pedido, pagamento = null) {
+  return (
+    numeroPositivo(pedido.valorPago) ||
+    valorPagoDoPagamento(pagamento) ||
+    numeroPositivo(pedido.pagamentoValorTotal)
+  );
+}
+
+function valorOrcamentoDoPedido(pedido) {
+  return numeroPositivo(
+    pedido.valorOrcamento || pedido.valorServico || pedido.valorTotal
+  );
 }
 
 function txidDoPedido(pedidoId) {
@@ -423,17 +456,31 @@ async function reconciliarRepassePixEfiPendente(pedidoId, dadosPedido = null) {
   const prestadorId = String(
     repasse.prestadorId || pedido.prestadorId || pedido.aceitoPor || ""
   );
-  const valorTotal = Number(
-    repasse.valorTotal || pedido.valorTotal || valorDoPedido(pedido)
-  );
-  const comissaoApp = Number(
-    repasse.comissaoApp || pedido.comissaoApp || (valorTotal * 0.1).toFixed(2)
-  );
-  const valorPrestador = Number(
-    repasse.valorPrestador ||
-      pedido.valorPrestador ||
-      (valorTotal - comissaoApp).toFixed(2)
-  );
+  const valorPago = valorPagoDoPedido(pedido);
+  const valorOrcamento = valorOrcamentoDoPedido(pedido);
+  const valorBaseRepasse = valorPago || valorOrcamento || valorDoPedido(pedido);
+  const {
+    valorTotal,
+    comissaoApp,
+    valorPrestador: valorTrabalhador,
+  } = calcularValores(valorBaseRepasse);
+  const valorPrestador = valorTrabalhador;
+
+  console.log("Reconciliando repasse Pix Efi; valores recalculados.", {
+    pedidoId: String(pedidoId),
+    idEnvio,
+    valorPago,
+    valorOrcamento,
+    valorTotal,
+    valorTrabalhador,
+    comissaoApp,
+    valorEnviadoParaEfi: somenteDinheiro(valorPrestador),
+    valoresSalvosRepasse: {
+      valorTotal: repasse.valorTotal || null,
+      valorPrestador: repasse.valorPrestador || null,
+      comissaoApp: repasse.comissaoApp || null,
+    },
+  });
 
   const comprovante = await marcarRepassePixEfiConcluido({
     pedidoRef,
@@ -1016,6 +1063,20 @@ async function confirmarPagamentoEfi(txid, pedidoIdInformado) {
     };
   }
 
+  const valorPago = numeroPositivo(cobrancaAtual.valor?.original) ||
+    valorPagoDoPagamento(pagamento);
+  const { valorTotal, comissaoApp, valorPrestador } = calcularValores(valorPago);
+
+  console.log("Pagamento Pix Efi confirmado; valores gravados no pedido.", {
+    pedidoId,
+    txid: txidSeguro,
+    valorPago,
+    valorTotal,
+    comissaoApp,
+    valorPrestador,
+    cobrancaEfi: cobrancaAtual,
+  });
+
   await pagamentoRef.set({
     ...pagamento,
     provedor: "efi",
@@ -1024,6 +1085,10 @@ async function confirmarPagamentoEfi(txid, pedidoIdInformado) {
     status: "CONCLUIDA",
     pagamentoStatus: "pago_bloqueado",
     pago: true,
+    valorPago,
+    valorTotal,
+    comissaoApp,
+    valorPrestador,
     cobrancaEfiConfirmada: cobrancaAtual,
     atualizadoEm: agora(),
   }, { merge: true });
@@ -1032,6 +1097,10 @@ async function confirmarPagamentoEfi(txid, pedidoIdInformado) {
     pago: true,
     pagamentoStatus: "pago_bloqueado",
     status: "pago_aguardando_trabalhador",
+    valorPago,
+    valorTotal,
+    comissaoApp,
+    valorPrestador,
     chatLiberado: false,
     localizacaoLiberada: false,
     dinheiroRetidoAteConfirmacao: true,
@@ -1250,13 +1319,22 @@ app.post("/clienteConfirmouServico", async (req, res) => {
       return res.status(400).json({ erro: erroSemPix.message });
     }
 
-    const valorTotal = Number(pedido.valorTotal || valorDoPedido(pedido));
-    const comissaoApp = Number(
-      pedido.comissaoApp || (valorTotal * 0.1).toFixed(2)
-    );
-    const valorPrestador = Number(
-      pedido.valorPrestador || (valorTotal - comissaoApp).toFixed(2)
-    );
+    const pagamentoIdSeguro = String(
+      pedido.txidEfi || pedido.pagamentoId || txidDoPedido(pedidoIdSeguro)
+    ).trim();
+    const pagamentoSnap = pagamentoIdSeguro
+      ? await db.collection("pagamentos").doc(pagamentoIdSeguro).get()
+      : null;
+    const pagamento = pagamentoSnap?.exists ? pagamentoSnap.data() || {} : null;
+    const valorPago = valorPagoDoPedido(pedido, pagamento);
+    const valorOrcamento = valorOrcamentoDoPedido(pedido);
+    const valorBaseRepasse = valorPago || valorOrcamento || valorDoPedido(pedido);
+    const {
+      valorTotal,
+      comissaoApp,
+      valorPrestador: valorTrabalhador,
+    } = calcularValores(valorBaseRepasse);
+    const valorPrestador = valorTrabalhador;
 
     if (!Number.isFinite(valorPrestador) || valorPrestador <= 0) {
       return res.status(400).json({ erro: "Valor do repasse invalido." });
@@ -1271,9 +1349,20 @@ app.post("/clienteConfirmouServico", async (req, res) => {
       clienteId: clienteIdSeguro,
       prestadorId,
       idEnvio,
+      pagamentoId: pagamentoIdSeguro,
+      valorPago,
+      valorOrcamento,
       valorTotal,
+      valorTrabalhador,
       comissaoApp,
       valorPrestador,
+      valorEnviadoParaEfi: somenteDinheiro(valorPrestador),
+      valoresSalvosNoPedido: {
+        valorTotal: pedido.valorTotal || null,
+        valorServico: pedido.valorServico || null,
+        valorPrestador: pedido.valorPrestador || null,
+        comissaoApp: pedido.comissaoApp || null,
+      },
     });
 
     await db.runTransaction(async (transaction) => {
@@ -1305,9 +1394,12 @@ app.post("/clienteConfirmouServico", async (req, res) => {
           clienteConfirmouServico: true,
           clienteConfirmouFinalizacao: true,
           clienteConfirmouEm: agora(),
+          valorPago,
+          valorOrcamento,
           valorTotal,
           comissaoApp,
           valorPrestador,
+          valorTrabalhador,
           repassePrestadorStatus: "processando",
           repassePrestadorIdEnvio: idEnvio,
           repassePrestadorSolicitadoEm: agora(),
@@ -1323,9 +1415,13 @@ app.post("/clienteConfirmouServico", async (req, res) => {
         clienteId: clienteIdSeguro,
         prestadorId,
         chavePixTrabalhador,
+        pagamentoId: pagamentoIdSeguro,
+        valorPago,
+        valorOrcamento,
         valorTotal,
         comissaoApp,
         valorPrestador,
+        valorTrabalhador,
         provedor: "efi",
         idEnvio,
         idEnvioEfi: idEnvio,
@@ -1336,8 +1432,21 @@ app.post("/clienteConfirmouServico", async (req, res) => {
       { merge: true }
     );
 
+    const valorEnviadoParaEfi = somenteDinheiro(valorPrestador);
+
+    console.log("Enviando repasse Pix Efi.", {
+      pedidoId: pedidoIdSeguro,
+      valorPago,
+      valorOrcamento,
+      valorTotal,
+      valorTrabalhador,
+      comissaoApp,
+      valorEnviadoParaEfi,
+      endpoint: `/v3/gn/pix/${idEnvio}`,
+    });
+
     const envio = await efiRequest("PUT", `/v3/gn/pix/${idEnvio}`, {
-      valor: somenteDinheiro(valorPrestador),
+      valor: valorEnviadoParaEfi,
       pagador: {
         chave: cfg.chavePixApp,
         infoPagador: `Repasse Faz Pra Mim pedido ${pedidoIdSeguro}`.slice(

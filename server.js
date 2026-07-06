@@ -169,16 +169,96 @@ function repassePixEfiConfirmado(envio) {
   ].includes(status);
 }
 
-async function consultarRepassePixEfi(idEnvio) {
-  try {
-    return await efiRequest("GET", `/v2/gn/pix/${idEnvio}`);
-  } catch (e) {
-    console.error("Erro ao consultar repasse Pix Efi:", {
-      idEnvio,
-      erro: erroPublicoEfi(e),
+function e2eIdDoRepassePixEfi(...fontes) {
+  for (const fonte of fontes) {
+    if (!fonte || typeof fonte !== "object") continue;
+
+    const e2eId = String(
+      fonte.endToEndId || fonte.e2eId || fonte.end_to_end_id || ""
+    ).trim();
+    if (e2eId) return e2eId;
+  }
+
+  return "";
+}
+
+function idEnvioValidoRepassePixEfi(idEnvio) {
+  return /^[A-Za-z0-9_-]{1,35}$/.test(String(idEnvio || "").trim());
+}
+
+function idEnvioDoRepassePixEfi(...fontes) {
+  for (const fonte of fontes) {
+    if (!fonte || typeof fonte !== "object") continue;
+
+    const idEnvio = String(
+      fonte.idEnvio || fonte.id_envio || fonte.repassePrestadorIdEnvio || ""
+    ).trim();
+    if (idEnvioValidoRepassePixEfi(idEnvio)) return idEnvio;
+  }
+
+  return "";
+}
+
+async function consultarRepassePixEfi(idEnvio, ...fontes) {
+  const e2eId = e2eIdDoRepassePixEfi(...fontes);
+  const idEnvioSeguro = idEnvioValidoRepassePixEfi(idEnvio)
+    ? String(idEnvio).trim()
+    : idEnvioDoRepassePixEfi(...fontes);
+  const consultas = [];
+
+  if (idEnvioSeguro) {
+    consultas.push({
+      tipoIdentificador: "idEnvio",
+      identificador: idEnvioSeguro,
+      path: `/v2/gn/pix/enviados/id-envio/${encodeURIComponent(idEnvioSeguro)}`,
+    });
+  }
+
+  if (e2eId) {
+    consultas.push({
+      tipoIdentificador: "endToEndId",
+      identificador: e2eId,
+      path: `/v2/gn/pix/enviados/${encodeURIComponent(e2eId)}`,
+    });
+  }
+
+  if (!consultas.length) {
+    console.warn("Repasse Pix Efi sem identificador consultavel.", {
+      idEnvioRecebido: idEnvio || "",
+      e2eId,
     });
     return null;
   }
+
+  for (const consulta of consultas) {
+    const { tipoIdentificador, identificador, path } = consulta;
+
+    try {
+      console.log("Consultando repasse Pix Efi.", {
+        tipoIdentificador,
+        identificador,
+        endpoint: path,
+      });
+      const resposta = await efiRequest("GET", path);
+      console.log("Consulta repasse Pix Efi OK.", {
+        tipoIdentificador,
+        identificador,
+        endpoint: path,
+        resposta,
+      });
+      return resposta;
+    } catch (e) {
+      console.error("Erro ao consultar repasse Pix Efi:", {
+        idEnvio,
+        identificador,
+        tipoIdentificador,
+        endpoint: path,
+        erro: erroPublicoEfi(e),
+      });
+    }
+  }
+
+  return null;
 }
 
 function comprovanteRepassePixEfi({
@@ -226,8 +306,10 @@ async function marcarRepassePixEfiConcluido({
       repassePrestadorStatus: "concluido",
       repassePrestadorMensagem:
         "Servico confirmado. Repasse enviado com sucesso ao trabalhador.",
+      repassePrestadorIdEnvio: idEnvio,
       repassePrestadorDadosEfi: envio || null,
       repassePrestadorConsultaEfi: consultaRepasse || null,
+      repassePrestadorEndToEndId: e2eIdDoRepassePixEfi(consultaRepasse, envio),
       repassePrestadorComprovante: comprovante,
       repassePrestadorEm: agora(),
       dinheiroRetidoAteConfirmacao: false,
@@ -246,6 +328,8 @@ async function marcarRepassePixEfiConcluido({
       valorPrestador,
       provedor: "efi",
       idEnvio,
+      idEnvioEfi: idEnvioDoRepassePixEfi(consultaRepasse, envio) || idEnvio,
+      endToEndId: e2eIdDoRepassePixEfi(consultaRepasse, envio),
       status: "concluido",
       dadosEfi: envio || null,
       consultaEfi: consultaRepasse || null,
@@ -275,7 +359,10 @@ async function reconciliarRepassePixEfiPendente(pedidoId, dadosPedido = null) {
   const pedidoRef = db.collection("pedidos").doc(String(pedidoId));
   const pedidoSnap = dadosPedido ? null : await pedidoRef.get();
   const pedido = dadosPedido || (pedidoSnap.exists ? pedidoSnap.data() || {} : {});
-  const idEnvio = String(pedido.repassePrestadorIdEnvio || "").trim();
+  const idEnvioLegado = String(pedido.repassePrestadorIdEnvio || "").trim();
+  const idEnvio = idEnvioValidoRepassePixEfi(idEnvioLegado)
+    ? idEnvioLegado
+    : idEnvioDoPedido(pedidoId);
 
   if (!idEnvio || pedido.repassePrestadorStatus !== "processando") {
     return { concluido: false, idEnvio };
@@ -283,7 +370,28 @@ async function reconciliarRepassePixEfiPendente(pedidoId, dadosPedido = null) {
 
   const repasseSnap = await db.collection("repasses").doc(idEnvio).get();
   const repasse = repasseSnap.exists ? repasseSnap.data() || {} : {};
-  const consultaRepasse = await consultarRepassePixEfi(idEnvio);
+  const envioSalvo = repasse.dadosEfi || pedido.repassePrestadorDadosEfi || null;
+  const consultaSalva = repasse.consultaEfi || pedido.repassePrestadorConsultaEfi || null;
+  if (idEnvioLegado && idEnvioLegado !== idEnvio) {
+    console.warn("Repasse Pix Efi com idEnvio legado invalido; usando idEnvio calculado.", {
+      pedidoId: String(pedidoId),
+      idEnvioLegado,
+      idEnvioCalculado: idEnvio,
+    });
+  }
+  const idEnvioConsulta = idEnvioDoRepassePixEfi(
+    repasse,
+    envioSalvo,
+    consultaSalva,
+    pedido.repassePrestadorComprovante
+  ) || idEnvio;
+  const consultaRepasse = await consultarRepassePixEfi(
+    idEnvioConsulta,
+    envioSalvo,
+    consultaSalva,
+    repasse,
+    pedido.repassePrestadorComprovante
+  );
 
   if (!repassePixEfiConfirmado(consultaRepasse)) {
     await db.collection("repasses").doc(idEnvio).set(
@@ -291,9 +399,19 @@ async function reconciliarRepassePixEfiPendente(pedidoId, dadosPedido = null) {
         pedidoId: String(pedidoId),
         provedor: "efi",
         idEnvio,
+        idEnvioEfi: idEnvioDoRepassePixEfi(consultaRepasse, consultaSalva, envioSalvo, repasse) || idEnvioConsulta,
+        endToEndId: e2eIdDoRepassePixEfi(consultaRepasse, consultaSalva, envioSalvo, repasse),
         status: "processando",
         consultaEfi: consultaRepasse || null,
         ultimaConsultaEm: agora(),
+        atualizadoEm: agora(),
+      },
+      { merge: true }
+    );
+
+    await pedidoRef.set(
+      {
+        repassePrestadorIdEnvio: idEnvio,
         atualizadoEm: agora(),
       },
       { merge: true }
@@ -322,7 +440,7 @@ async function reconciliarRepassePixEfiPendente(pedidoId, dadosPedido = null) {
     pedidoId: String(pedidoId),
     prestadorId,
     idEnvio,
-    envio: repasse.dadosEfi || pedido.repassePrestadorDadosEfi || null,
+    envio: envioSalvo,
     consultaRepasse,
     valorPrestador,
     valorTotal,
@@ -601,7 +719,12 @@ async function efiRequest(method, path, data, extraHeaders = {}) {
     );
   }
 
-  console.log("Efí request OK:", { method, path, status: resposta.status });
+  console.log("Efí request OK:", {
+    method,
+    path,
+    status: resposta.status,
+    data: resposta.data,
+  });
   return resposta.data;
 }
 
@@ -1205,6 +1328,7 @@ app.post("/clienteConfirmouServico", async (req, res) => {
         valorPrestador,
         provedor: "efi",
         idEnvio,
+        idEnvioEfi: idEnvio,
         status: "processando",
         criadoEm: agora(),
         atualizadoEm: agora(),
@@ -1212,7 +1336,7 @@ app.post("/clienteConfirmouServico", async (req, res) => {
       { merge: true }
     );
 
-    const envio = await efiRequest("PUT", `/v2/gn/pix/${idEnvio}`, {
+    const envio = await efiRequest("PUT", `/v3/gn/pix/${idEnvio}`, {
       valor: somenteDinheiro(valorPrestador),
       pagador: {
         chave: cfg.chavePixApp,
@@ -1227,24 +1351,29 @@ app.post("/clienteConfirmouServico", async (req, res) => {
     console.log("Resposta do repasse Pix Efi recebida.", {
       pedidoId: pedidoIdSeguro,
       idEnvio,
+      idEnvioEfi: envio.idEnvio || "",
       endToEndId: envio.endToEndId || envio.e2eId || "",
       status: envio.status || envio.situacao || envio.estado || "",
+      resposta: envio,
     });
 
-    const consultaRepasse = await consultarRepassePixEfi(idEnvio);
+    const consultaRepasse = await consultarRepassePixEfi(idEnvio, envio);
     const confirmacaoRepasse = consultaRepasse || envio;
+    const endToEndIdRepasse = e2eIdDoRepassePixEfi(consultaRepasse, envio);
+    const idEnvioEfi = idEnvioDoRepassePixEfi(consultaRepasse, envio) || idEnvio;
 
     console.log("Consulta do repasse Pix Efi recebida.", {
       pedidoId: pedidoIdSeguro,
       idEnvio,
-      endToEndId:
-        confirmacaoRepasse.endToEndId || confirmacaoRepasse.e2eId || "",
+      idEnvioEfi,
+      endToEndId: endToEndIdRepasse,
       status:
         confirmacaoRepasse.status ||
         confirmacaoRepasse.situacao ||
         confirmacaoRepasse.estado ||
         "",
       valor: confirmacaoRepasse.valor || "",
+      resposta: confirmacaoRepasse,
     });
 
     if (!repassePixEfiConfirmado(confirmacaoRepasse)) {
@@ -1265,6 +1394,7 @@ app.post("/clienteConfirmouServico", async (req, res) => {
           repassePrestadorMensagem: mensagemProcessando,
           repassePrestadorDadosEfi: envio,
           repassePrestadorConsultaEfi: consultaRepasse,
+          repassePrestadorEndToEndId: endToEndIdRepasse,
           dinheiroRetidoAteConfirmacao: true,
           atualizadoEm: agora(),
         },
@@ -1274,6 +1404,8 @@ app.post("/clienteConfirmouServico", async (req, res) => {
       await db.collection("repasses").doc(idEnvio).set(
         {
           status: "processando",
+          idEnvioEfi,
+          endToEndId: endToEndIdRepasse,
           dadosEfi: envio,
           consultaEfi: consultaRepasse,
           mensagem: mensagemProcessando,

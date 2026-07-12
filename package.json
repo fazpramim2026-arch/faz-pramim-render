@@ -1,7 +1,7 @@
 {
-  "name": "faz-pramim-efi-render-backend",
+  "name": "faz-pramim-asaas-render-backend",
   "version": "1.0.0",
-  "description": "Backend Faz Pra Mim com Efí Pix Cash-In/Cash-Out para Render",
+  "description": "Backend Faz Pra Mim com Asaas Pix para Render",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -17,3 +17,4 @@
     "node": ">=20"
   }
 }
+

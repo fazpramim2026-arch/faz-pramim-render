@@ -107,7 +107,7 @@ function trabalhadorEscolhidoDoPedido(pedido) {
   ).trim();
 }
 
-function chavePixDoCadastroTrabalhador(trabalhador) {
+function chavePixDoCadastroTrabalhador(trabalhador, colecao = "users") {
   const campos = [
     ["chavePix", trabalhador?.chavePix],
     ["pix", trabalhador?.pix],
@@ -121,7 +121,7 @@ function chavePixDoCadastroTrabalhador(trabalhador) {
     if (chavePix) {
       return {
         chavePix,
-        origemChavePix: `usuarios.${campo}`,
+        origemChavePix: `${colecao}.${campo}`,
       };
     }
   }
@@ -169,14 +169,20 @@ async function carregarTrabalhadorEscolhidoDoPedido(pedido) {
     throw erro;
   }
 
-  const trabalhadorDoc = await db
-    .collection("usuarios")
-    .doc(trabalhadorId)
-    .get();
+  let colecaoTrabalhador = "users";
+  let trabalhadorDoc = await db.collection("users").doc(trabalhadorId).get();
+
+  if (!trabalhadorDoc.exists) {
+    colecaoTrabalhador = "usuarios";
+    trabalhadorDoc = await db.collection("usuarios").doc(trabalhadorId).get();
+  }
+
   const trabalhador =
     trabalhadorDoc && trabalhadorDoc.exists ? trabalhadorDoc.data() || {} : {};
-  const { chavePix, origemChavePix } =
-    chavePixDoCadastroTrabalhador(trabalhador);
+  const { chavePix, origemChavePix } = chavePixDoCadastroTrabalhador(
+    trabalhador,
+    colecaoTrabalhador
+  );
 
   return {
     trabalhadorId,
@@ -320,6 +326,13 @@ async function asaasRequest(path, options = {}) {
     erro.data = resposta.data;
     throw erro;
   }
+
+  console.log("[ASAAS] Request OK", {
+    method,
+    path,
+    status: resposta.status,
+    data: resposta.data,
+  });
 
   return resposta.data;
 }
@@ -574,6 +587,8 @@ async function confirmarPagamentoAsaas(pagamentoId, pedidoIdInformado = "") {
         chatLiberado: false,
         localizacaoLiberada: false,
         dinheiroRetidoAteConfirmacao: true,
+        repasseStatus: "liberado_para_repasse",
+        repassePrestadorStatus: "liberado_para_repasse",
         pagamentoConfirmadoEm: agora(),
         updatedAt: agora(),
         atualizadoEm: agora(),
@@ -663,7 +678,8 @@ async function solicitarRepasseTrabalhadorAsaas(
       sucesso: true,
       duplicado: true,
       status: repasseStatusAtual,
-      asaasTransferId: pedido.asaasTransferId || "",
+      repasseId: pedido.repasseId || pedido.asaasTransferId || "",
+      asaasTransferId: pedido.asaasTransferId || pedido.repasseId || "",
       valorRepassado: pedido.valorRepassado || pedido.valorPrestador || 0,
     };
   }
@@ -745,15 +761,25 @@ async function solicitarRepasseTrabalhadorAsaas(
   try {
     const chavePix = chavePixParaAsaas(chavePixTrabalhador);
     const pixAddressKeyType = tipoChavePixAsaas(chavePixTrabalhador);
+    const dadosTransferencia = {
+      value: valorRepassado,
+      operationType: "PIX",
+      pixAddressKey: chavePix,
+      pixAddressKeyType,
+      description: `Repasse Faz Pra Mim pedido ${pedidoIdSeguro}`.slice(0, 140),
+    };
+
+    console.log("[ASAAS] Tentativa de repasse Pix", {
+      pedidoId: pedidoIdSeguro,
+      trabalhadorId,
+      pixAddressKeyType,
+      valorRepassado,
+      dadosTransferencia,
+    });
+
     const transferencia = await asaasRequest("/transfers", {
       method: "POST",
-      data: {
-        value: valorRepassado,
-        operationType: "PIX",
-        pixAddressKey: chavePix,
-        pixAddressKeyType,
-        description: `Repasse Faz Pra Mim pedido ${pedidoIdSeguro}`.slice(0, 140),
-      },
+      data: dadosTransferencia,
     });
     const asaasTransferId = String(transferencia.id || "").trim();
     const statusTransferencia = String(transferencia.status || "PENDING")
@@ -778,6 +804,7 @@ async function solicitarRepasseTrabalhadorAsaas(
         repasseGateway: "asaas",
         repasseStatus,
         repassePrestadorStatus: repasseStatus,
+        repasseId: asaasTransferId,
         asaasTransferId,
         valorRepassado,
         valorTrabalhador: valorPrestador,
@@ -804,6 +831,7 @@ async function solicitarRepasseTrabalhadorAsaas(
           trabalhadorNome: trabalhador.nome || trabalhador.nomeCompleto || "",
           provedor: "asaas",
           gateway: "asaas",
+          repasseId: asaasTransferId,
           asaasTransferId,
           status: repasseStatus,
           statusAsaas: statusTransferencia,
@@ -824,6 +852,7 @@ async function solicitarRepasseTrabalhadorAsaas(
       sucesso: true,
       gateway: "asaas",
       repasseStatus,
+      repasseId: asaasTransferId,
       asaasTransferId,
       valorRepassado,
       transferencia,
@@ -842,6 +871,7 @@ async function solicitarRepasseTrabalhadorAsaas(
         repasseStatus: "erro",
         repassePrestadorStatus: "erro",
         repasseErro: erro,
+        repasseErroDetalhado: erro,
         repasseErroEm: agora(),
         repassePrestadorErro: erro,
         pagamentoStatus: "repasse_erro",
@@ -901,6 +931,7 @@ app.post(["/criarPagamentoPix", "/criarPagamentoPixAsaas"], async (req, res) => 
       emailCliente,
       telefoneCliente,
       cpfCnpjCliente,
+      descricao,
     } = req.body || {};
     const pedidoIdSeguro = normalizarId(pedidoId);
 
@@ -972,29 +1003,34 @@ app.post(["/criarPagamentoPix", "/criarPagamentoPixAsaas"], async (req, res) => 
 
     const customer = await buscarOuCriarCustomerAsaas({
       clienteId: clienteIdSeguro,
-      nomeCliente,
-      emailCliente: decoded.email || emailCliente,
-      telefoneCliente,
-      cpfCnpjCliente,
+      nomeCliente:
+        nomeCliente || pedido.nomeCliente || decoded.name || decoded.email ||
+        `Cliente ${clienteIdSeguro}`,
+      emailCliente: decoded.email || emailCliente || pedido.emailCliente,
+      telefoneCliente: telefoneCliente || pedido.telefoneCliente,
+      cpfCnpjCliente: cpfCnpjCliente || pedido.cpfCnpjCliente,
     });
+
+    const dadosCobranca = {
+      customer: customer.id,
+      billingType: "PIX",
+      dueDate: dataHojeIso(),
+      value: valorTotal,
+      description: normalizarDescricao(descricao || `Pedido Faz Pra Mim ${pedidoIdSeguro}`),
+      externalReference: pedidoIdSeguro,
+    };
 
     console.log("[ASAAS] Criando cobranca Pix", {
       pedidoId: pedidoIdSeguro,
       clienteId: clienteIdSeguro,
       trabalhadorId: trabalhadorIdSeguro,
       valorTotal,
+      dadosCobranca,
     });
 
     const pagamento = await asaasRequest("/payments", {
       method: "POST",
-      data: {
-        customer: customer.id,
-        billingType: "PIX",
-        dueDate: dataHojeIso(),
-        value: valorTotal,
-        description: `Pedido Faz Pra Mim ${pedidoIdSeguro}`,
-        externalReference: pedidoIdSeguro,
-      },
+      data: dadosCobranca,
     });
     const pagamentoId = String(pagamento.id || "").trim();
 
@@ -1156,6 +1192,8 @@ app.post("/webhookAsaas", async (req, res) => {
         chatLiberado: false,
         localizacaoLiberada: false,
         dinheiroRetidoAteConfirmacao: true,
+        repasseStatus: "liberado_para_repasse",
+        repassePrestadorStatus: "liberado_para_repasse",
         pagamentoConfirmadoEm: agora(),
       });
 
